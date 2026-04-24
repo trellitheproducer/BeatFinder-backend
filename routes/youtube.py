@@ -6,8 +6,8 @@ import os
 router = APIRouter()
 
 YT_API_KEY  = os.getenv("YOUTUBE_API_KEY", "")
-YT_SEARCH   = “https://www.googleapis.com/youtube/v3/search”
-YT_CHANNELS = “https://www.googleapis.com/youtube/v3/channels”
+YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search”
+YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels”
 
 def decode(text):
 text = text.replace(”"”, ‘”’)
@@ -23,7 +23,7 @@ raise HTTPException(status_code=504, detail=“Timed out”)
 except httpx.RequestError:
 raise HTTPException(status_code=502, detail=“Unreachable”)
 if r.status_code != 200:
-err = r.json().get(“error”, {})
+err = r.json().get("error”, {})
 reason = err.get(“errors”, [{}])[0].get(“reason”, “unknown”)
 if reason == “keyInvalid”:
 raise HTTPException(status_code=401, detail=“Invalid API key”)
