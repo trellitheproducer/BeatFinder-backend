@@ -82,7 +82,7 @@ for item in data.get("items", []):
 return {"query": query, "total": len(beats), "beats": beats}
 ```
 
-# ── Artist photo — searches YouTube for the artist’s official channel ─
+# ── Artist photo - searches YouTube for the artist’s official channel ─
 
 # Returns the channel avatar URL which works for every artist.
 
