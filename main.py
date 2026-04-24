@@ -1,3 +1,8 @@
+"""
+BeatFinder Backend — FastAPI + MongoDB + YouTube Data API
+Deploy to Railway or Render (free tier)
+"""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
