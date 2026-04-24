@@ -10,9 +10,9 @@ YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search"
 YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
 
 def decode(text):
-text = text.replace(”"”, ‘”’)
-text = text.replace(”'”, “’”)
-text = text.replace(”&”, “&”)
+text = text.replace(""", "")
+text = text.replace(""", """)
+text = text.replace("&", "&")
 return text
 
 async def yt_get(client, url, params):
