@@ -1,0 +1,64 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+import os
+
+from routes.auth import router as auth_router
+from routes.beats import router as beats_router
+from routes.youtube import router as youtube_router
+from routes.admin import router as admin_router
+
+load_dotenv()
+
+
+# ── Startup / shutdown ────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.mongo = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
+    app.state.db    = app.state.mongo[os.getenv("MONGODB_DB", "beatfinder")]
+    print("✅ MongoDB connected")
+    yield
+    app.state.mongo.close()
+    print("🔌 MongoDB disconnected")
+
+
+# ── App ───────────────────────────────────────────────────────────
+app = FastAPI(
+    title="BeatFinder API",
+    version="1.0.0",
+    description="Backend for BeatFinder — type beat discovery app",
+    lifespan=lifespan,
+)
+
+# ── CORS — Vercel frontend + local dev ───────────────────────────
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:5173"
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Routers ───────────────────────────────────────────────────────
+app.include_router(auth_router,    prefix="/api/auth",    tags=["Auth"])
+app.include_router(beats_router,   prefix="/api/beats",   tags=["Saved Beats"])
+app.include_router(youtube_router, prefix="/api/youtube", tags=["YouTube"])
+app.include_router(admin_router,   prefix="/api/admin",   tags=["Admin"])
+
+
+# ── Health ────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "BeatFinder API v1.0"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
