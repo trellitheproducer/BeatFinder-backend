@@ -5,7 +5,7 @@ import os
 
 router = APIRouter()
 
-YT_API_KEY  = os.getenv(“YOUTUBE_API_KEY”, “”)
+YT_API_KEY  = os.getenv("YOUTUBE_API_KEY", "")
 YT_SEARCH   = “https://www.googleapis.com/youtube/v3/search”
 YT_CHANNELS = “https://www.googleapis.com/youtube/v3/channels”
 
