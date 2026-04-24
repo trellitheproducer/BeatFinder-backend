@@ -10,9 +10,10 @@ from datetime import datetime
 # ── Auth ──────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    name:     str       = Field(..., min_length=1, max_length=80)
+    name:     str = Field(..., min_length=1, max_length=80)
     email:    EmailStr
-    password: str       = Field(..., min_length=6)
+    password: str = Field(..., min_length=6)
+
 
 class LoginRequest(BaseModel):
     email:    EmailStr
