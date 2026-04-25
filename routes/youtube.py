@@ -301,6 +301,7 @@ async def trending_beats(request: Request):
 
     # Sort by views descending
     beats.sort(key=lambda b: b["views"], reverse=True)
+beats = beats[:10]
 
     await set_cached(db, cache_key, beats)
     print("[Cache SET] trending_1m - " + str(len(beats)) + " beats with 1M+ views")
