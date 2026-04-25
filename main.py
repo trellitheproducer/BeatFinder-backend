@@ -1,5 +1,5 @@
 """
-BeatFinder Backend — FastAPI + MongoDB + YouTube Data API
+BeatFinder Backend - FastAPI + MongoDB + YouTube Data API
 Deploy to Railway or Render (free tier)
 """
 
@@ -23,7 +23,11 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     app.state.mongo = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
     app.state.db    = app.state.mongo[os.getenv("MONGODB_DB", "beatfinder")]
-    print("✅ MongoDB connected")
+    print("MongoDB connected")
+    # Create indexes for fast cache lookups and TTL expiry
+    await app.state.db.yt_cache.create_index("cached_at")
+    await app.state.db.yt_cache.create_index([("_id", 1)])
+    print("Cache indexes ready")
     yield
     app.state.mongo.close()
     print("🔌 MongoDB disconnected")
@@ -33,11 +37,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BeatFinder API",
     version="1.0.0",
-    description="Backend for BeatFinder — type beat discovery app",
+    description="Backend for BeatFinder - type beat discovery app",
     lifespan=lifespan,
 )
 
-# ── CORS — Vercel frontend + local dev ───────────────────────────
+# ── CORS - Vercel frontend + local dev ───────────────────────────
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:3000,http://localhost:5173"
