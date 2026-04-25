@@ -18,11 +18,14 @@ bearer      = HTTPBearer()
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    # bcrypt limit is 72 bytes - truncate safely
+    pw = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+    return pwd_context.hash(pw)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    pw = plain.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+    return pwd_context.verify(pw, hashed)
 
 
 def create_token(user_id: str, email: str) -> str:
