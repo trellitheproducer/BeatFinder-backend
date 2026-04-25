@@ -48,10 +48,12 @@ async def yt_get(client, url, params):
 async def youtube_search(
     artist: str = Query(...),
     max: int = Query(20, ge=1, le=50),
+    page: int = Query(1, ge=1, le=10),
 ):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key")
-    query = artist + " type beat"
+    suffix = PAGE_SUFFIXES[(page - 1) % len(PAGE_SUFFIXES)]
+    query = artist + " type beat " + suffix
     async with httpx.AsyncClient(timeout=10.0) as client:
         data = await yt_get(client, YT_SEARCH, {
             "part": "snippet",
@@ -113,3 +115,17 @@ async def artist_photo(artist: str = Query(...)):
             thumbs.get("default", {}).get("url")
         )
     return {"artist": artist, "photo": photo}
+
+
+PAGE_SUFFIXES = [
+    "free instrumental",
+    "2025 free",
+    "2024 free instrumental",
+    "new 2025",
+    "hard trap instrumental",
+    "melodic instrumental",
+    "free download",
+    "best free",
+    "official instrumental",
+    "2026 free instrumental",
+]
