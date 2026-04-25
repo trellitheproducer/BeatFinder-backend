@@ -86,10 +86,11 @@ async def set_cached(db, cache_key, beats):
 
 @router.get("/search")
 async def youtube_search(
-    request: Request,
-    artist:  str = Query(...),
-    max:     int = Query(20, ge=1, le=50),
-    page:    int = Query(1, ge=1, le=10),
+    request:      Request,
+    artist:       str  = Query(...),
+    max:          int  = Query(20, ge=1, le=50),
+    page:         int  = Query(1, ge=1, le=10),
+    filter_title: bool = Query(True),
 ):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
@@ -125,7 +126,7 @@ async def youtube_search(
             continue
         s     = item["snippet"]
         title = decode(s.get("title", ""))
-        if artist_lower not in title.lower():
+        if filter_title and artist_lower not in title.lower():
             continue
         t = s.get("thumbnails", {})
         beats.append({
