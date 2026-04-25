@@ -35,10 +35,13 @@ def _public(user: dict) -> dict:
     }
 
 
-# ââ Register ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Register ──────────────────────────────────────────────────────
 @router.post("/register", response_model=TokenResponse, status_code=201)
 async def register(body: RegisterRequest, request: Request):
     db = request.app.state.db
+
+    if len(body.password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password too long. Maximum 72 characters.")
 
     if await db.users.find_one({"email": body.email}):
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -59,7 +62,7 @@ async def register(body: RegisterRequest, request: Request):
     return {"access_token": token, "user": _public(user)}
 
 
-# ââ Login âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Login ─────────────────────────────────────────────────────────
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request):
     db   = request.app.state.db
@@ -72,13 +75,13 @@ async def login(body: LoginRequest, request: Request):
     return {"access_token": token, "user": _public(user)}
 
 
-# ââ Me (protected) ââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── Me (protected) ────────────────────────────────────────────────
 @router.get("/me")
 async def me(user=Depends(get_current_user)):
     return _public(user)
 
 
-# ââ Upgrade plan (marks paid, frontend verifies PayPal separately) â
+# ── Upgrade plan (marks paid, frontend verifies PayPal separately) ─
 @router.post("/upgrade")
 async def upgrade_plan(
     body: PlanUpgradeRequest,
