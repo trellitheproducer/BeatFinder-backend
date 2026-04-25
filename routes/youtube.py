@@ -239,7 +239,7 @@ async def trending_beats(request: Request):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    cache_key = "trending_1m"
+    cache_key = "trending_1m_v2"
     db = request.app.state.db
 
     cached = await get_cached(db, cache_key)
