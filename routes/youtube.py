@@ -62,16 +62,21 @@ async def youtube_search(
             "q": query,
             "key": YT_KEY,
         })
+    artist_lower = artist.lower()
     beats = []
     for item in data.get("items", []):
         vid = item.get("id", {}).get("videoId")
         if not vid:
             continue
         s = item["snippet"]
+        title = decode(s.get("title", ""))
+        # Only include beats where the artist name appears in the title
+        if artist_lower not in title.lower():
+            continue
         t = s.get("thumbnails", {})
         beats.append({
             "videoId": vid,
-            "title": decode(s.get("title", "")),
+            "title": title,
             "channel": decode(s.get("channelTitle", "")),
             "thumbnail": (
                 t.get("high", {}).get("url") or
