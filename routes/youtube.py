@@ -218,3 +218,170 @@ async def cache_stats(request: Request):
         "cache_ttl_hours":      CACHE_HOURS,
         "message":              "Each fresh entry = 0 YouTube API calls saved",
     }
+
+
+# ── Trending beats with view counts ──────────────────────────────────────────
+# Searches for trending type beats, fetches real view counts via Videos API,
+# filters to 1M+ views only, sorts by view count descending.
+
+YT_VIDEOS = "https://www.googleapis.com/youtube/v3/videos"
+
+def format_views(n):
+    if n >= 1_000_000:
+        return str(round(n / 1_000_000, 1)) + "M views"
+    if n >= 1_000:
+        return str(round(n / 1_000, 1)) + "K views"
+    return str(n) + " views"
+
+
+@router.get("/trending")
+async def trending_beats(request: Request):
+    if not YT_KEY:
+        raise HTTPException(status_code=500, detail="No API key configured")
+
+    cache_key = "trending_1m"
+    db = request.app.state.db
+
+    cached = await get_cached(db, cache_key)
+    if cached:
+        print("[Cache HIT] trending_1m")
+        return {"beats": cached, "cached": True}
+
+    print("[Cache MISS] trending_1m - fetching from YouTube")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Search for trending type beats
+        search_data = await yt_get(client, YT_SEARCH, {
+            "part": "snippet",
+            "type": "video",
+            "maxResults": 50,
+            "q": "type beat free 2025",
+            "order": "viewCount",
+            "key": YT_KEY,
+        })
+
+        items = search_data.get("items", [])
+        if not items:
+            return {"beats": [], "cached": False}
+
+        # Collect video IDs
+        video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
+
+        # Fetch view counts from Videos API
+        stats_data = await yt_get(client, YT_VIDEOS, {
+            "part": "statistics,snippet",
+            "id": ",".join(video_ids),
+            "key": YT_KEY,
+        })
+
+    # Build beats with view counts, filter 1M+
+    beats = []
+    for item in stats_data.get("items", []):
+        vid = item.get("id")
+        if not vid:
+            continue
+        stats = item.get("statistics", {})
+        views = int(stats.get("viewCount", 0))
+        if views < 1_000_000:
+            continue
+        s = item.get("snippet", {})
+        t = s.get("thumbnails", {})
+        beats.append({
+            "videoId":   vid,
+            "title":     decode(s.get("title", "")),
+            "channel":   decode(s.get("channelTitle", "")),
+            "thumbnail": (
+                t.get("high",   {}).get("url") or
+                t.get("medium", {}).get("url") or
+                "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
+            ),
+            "views":      views,
+            "viewsLabel": format_views(views),
+        })
+
+    # Sort by views descending
+    beats.sort(key=lambda b: b["views"], reverse=True)
+
+    await set_cached(db, cache_key, beats)
+    print("[Cache SET] trending_1m - " + str(len(beats)) + " beats with 1M+ views")
+
+    return {"beats": beats, "cached": False}
+
+
+YT_VIDEOS = "https://www.googleapis.com/youtube/v3/videos"
+
+def format_views(n):
+    if n >= 1000000:
+        return str(round(n / 1000000, 1)) + "M views"
+    if n >= 1000:
+        return str(round(n / 1000, 1)) + "K views"
+    return str(n) + " views"
+
+
+@router.get("/trending")
+async def trending_beats(request: Request):
+    if not YT_KEY:
+        raise HTTPException(status_code=500, detail="No API key configured")
+
+    cache_key = "trending_1m"
+    db = request.app.state.db
+
+    cached = await get_cached(db, cache_key)
+    if cached:
+        print("[Cache HIT] trending_1m")
+        return {"beats": cached, "cached": True}
+
+    print("[Cache MISS] trending_1m - fetching from YouTube")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        search_data = await yt_get(client, YT_SEARCH, {
+            "part": "snippet",
+            "type": "video",
+            "maxResults": 50,
+            "q": "type beat free 2025",
+            "order": "viewCount",
+            "key": YT_KEY,
+        })
+
+        items = search_data.get("items", [])
+        if not items:
+            return {"beats": [], "cached": False}
+
+        video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
+
+        stats_data = await yt_get(client, YT_VIDEOS, {
+            "part": "statistics,snippet",
+            "id": ",".join(video_ids),
+            "key": YT_KEY,
+        })
+
+    beats = []
+    for item in stats_data.get("items", []):
+        vid = item.get("id")
+        if not vid:
+            continue
+        stats = item.get("statistics", {})
+        views = int(stats.get("viewCount", 0))
+        if views < 1000000:
+            continue
+        s = item.get("snippet", {})
+        t = s.get("thumbnails", {})
+        beats.append({
+            "videoId":   vid,
+            "title":     decode(s.get("title", "")),
+            "channel":   decode(s.get("channelTitle", "")),
+            "thumbnail": (
+                t.get("high",   {}).get("url") or
+                t.get("medium", {}).get("url") or
+                "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
+            ),
+            "views":      views,
+            "viewsLabel": format_views(views),
+        })
+
+    beats.sort(key=lambda b: b["views"], reverse=True)
+
+    await set_cached(db, cache_key, beats)
+    print("[Cache SET] trending_1m - " + str(len(beats)) + " beats")
+
+    return {"beats": beats, "cached": False}
