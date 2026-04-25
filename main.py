@@ -14,6 +14,7 @@ from routes.auth import router as auth_router
 from routes.beats import router as beats_router
 from routes.youtube import router as youtube_router
 from routes.admin import router as admin_router
+from routes.producer import router as producer_router
 
 load_dotenv()
 
@@ -60,6 +61,7 @@ app.include_router(auth_router,    prefix="/api/auth",    tags=["Auth"])
 app.include_router(beats_router,   prefix="/api/beats",   tags=["Saved Beats"])
 app.include_router(youtube_router, prefix="/api/youtube", tags=["YouTube"])
 app.include_router(admin_router,   prefix="/api/admin",   tags=["Admin"])
+app.include_router(producer_router, prefix="/api/producer", tags=["Producer Beats"])
 
 
 # ── Health ────────────────────────────────────────────────────────
