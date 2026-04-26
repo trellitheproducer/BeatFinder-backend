@@ -39,6 +39,7 @@ def _public(user: dict) -> dict:
         "name":         user["name"],
         "email":        user["email"],
         "plan":         user.get("plan", "free"),
+        "username":     user.get("username", ""),
         "is_admin":     user.get("is_admin", False),
         "created_at":   user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
