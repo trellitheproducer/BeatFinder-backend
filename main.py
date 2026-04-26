@@ -63,6 +63,10 @@ app.include_router(beats_router,   prefix="/api/beats",   tags=["Saved Beats"])
 app.include_router(youtube_router, prefix="/api/youtube", tags=["YouTube"])
 app.include_router(admin_router,   prefix="/api/admin",   tags=["Admin"])
 app.include_router(producer_router, prefix="/api/producer", tags=["Producer Beats"])
+
+# Lease webhook needs raw body - separate route
+from routes.producer import lease_webhook
+app.post("/api/producer/lease-webhook")(lease_webhook)
 app.include_router(stripe_router,   prefix="/api/stripe",   tags=["Stripe Payments"])
 
 
