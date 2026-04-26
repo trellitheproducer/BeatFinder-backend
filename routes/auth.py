@@ -222,6 +222,130 @@ async def activate_plan(
     return {"success": True, "plan": plan, "message": plan + " plan activated successfully!"}
 
 
+# ── Forgot password - send reset email ────────────────────────────────────────
+import secrets as secrets_mod
+import os
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FRONTEND_URL   = os.getenv("FRONTEND_URL", "https://beat-finder-frontend.vercel.app")
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token:        str
+    new_password: str
+
+@router.post("/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request):
+    db      = request.app.state.db
+    user_doc = await db.users.find_one({"email": body.email.lower().strip()})
+
+    # Always return success to prevent email enumeration
+    if not user_doc:
+        return {"success": True, "message": "If that email exists you will receive a reset link."}
+
+    token      = secrets_mod.token_urlsafe(32)
+    expires_at = datetime.utcnow().timestamp() + 3600  # 1 hour
+
+    await db.password_resets.insert_one({
+        "token":      token,
+        "user_id":    str(user_doc["_id"]),
+        "email":      body.email.lower().strip(),
+        "expires_at": expires_at,
+        "used":       False,
+    })
+
+    reset_url = FRONTEND_URL + "?reset_token=" + token
+
+    html = """
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#0a0a0a;color:white;padding:32px;border-radius:16px">
+  <div style="font-size:32px;font-weight:900;letter-spacing:4px;color:#C026D3;margin-bottom:8px">BEATFINDER</div>
+  <div style="color:#888;margin-bottom:24px">The World's #1 Beat Finder App</div>
+  <div style="color:white;font-size:20px;font-weight:700;margin-bottom:12px">Reset Your Password</div>
+  <div style="color:#aaa;margin-bottom:24px;line-height:1.7">We received a request to reset your password. Click the button below to create a new one. This link expires in 1 hour.</div>
+  <a href='""" + reset_url + """' style="display:block;background:linear-gradient(135deg,#C026D3,#7C3AED);border-radius:12px;color:white;font-weight:800;font-size:16px;padding:16px;text-align:center;text-decoration:none;margin-bottom:24px">Reset My Password</a>
+  <div style="color:#555;font-size:12px">If you didn't request this, ignore this email. Your password won't change.</div>
+</div>
+"""
+
+    import httpx as httpx_mod
+    async with httpx_mod.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
+            json={
+                "from":    "BeatFinder <noreply@beatfinder.app>",
+                "to":      [body.email],
+                "subject": "Reset your BeatFinder password",
+                "html":    html,
+            },
+        )
+
+    return {"success": True, "message": "If that email exists you will receive a reset link."}
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetPasswordRequest, request: Request):
+    db  = request.app.state.db
+    doc = await db.password_resets.find_one({"token": body.token, "used": False})
+
+    if not doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
+
+    if datetime.utcnow().timestamp() > doc["expires_at"]:
+        raise HTTPException(status_code=400, detail="Reset link has expired. Please request a new one.")
+
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+
+    from bson import ObjectId
+    new_hash = hash_password(body.new_password)
+    await db.users.update_one(
+        {"_id": ObjectId(doc["user_id"])},
+        {"$set": {"hashed_password": new_hash}}
+    )
+    await db.password_resets.update_one(
+        {"token": body.token},
+        {"$set": {"used": True}}
+    )
+    return {"success": True, "message": "Password reset successfully. You can now log in."}
+
+
+# ── Change password ───────────────────────────────────────────────────────────
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password:     str
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    request: Request,
+    user=Depends(get_current_user),
+):
+    db = request.app.state.db
+
+    if len(body.new_password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="New password too long. Maximum 72 characters.")
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+
+    user_doc = await db.users.find_one({"_id": user["_id"]})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(body.current_password, user_doc["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    new_hash = hash_password(body.new_password)
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"hashed_password": new_hash}}
+    )
+    return {"success": True, "message": "Password changed successfully"}
+
+
 # ── Admin: generate activation code ───────────────────────────────────────────
 class GenerateCodeRequest(BaseModel):
     plan:  str
