@@ -88,57 +88,77 @@ async def set_cached(db, cache_key, beats):
 async def youtube_search(
     request:      Request,
     artist:       str  = Query(...),
-    max:          int  = Query(20, ge=1, le=50),
+    max:          int  = Query(10, ge=1, le=50),
     page:         int  = Query(1, ge=1, le=10),
     filter_title: bool = Query(True),
 ):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    suffix    = PAGE_SUFFIXES[(page - 1) % len(PAGE_SUFFIXES)]
-    query     = artist + " type beat " + suffix
-    cache_key = artist.lower().replace(" ", "_") + "_p" + str(page)
+    # Use a master cache per artist that stores all beats, paginate from it
+    master_key   = artist.lower().replace(" ", "_") + "_master"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
+    query        = artist + " type beat"
 
     db = request.app.state.db
 
-    # 1. Try MongoDB cache first - costs 0 quota units
-    cached = await get_cached(db, cache_key)
+    # 1. Try page-level cache
+    cached = await get_cached(db, page_key)
     if cached:
-        print("[Cache HIT]  " + cache_key + " served from MongoDB")
+        print("[Cache HIT]  " + page_key + " served from MongoDB")
         return {"query": query, "total": len(cached), "beats": cached, "cached": True}
 
-    # 2. Cache miss - call YouTube API (costs 100 quota units)
-    print("[Cache MISS] " + cache_key + " fetching from YouTube")
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        data = await yt_get(client, YT_SEARCH, {
-            "part":       "snippet",
-            "type":       "video",
-            "maxResults": max,
-            "q":          query,
-            "key":        YT_KEY,
-        })
+    # 2. Try master cache - fetch all beats once, slice per page
+    master = await get_cached(db, master_key)
+    if not master:
+        # Fetch from YouTube using multiple suffixes to get variety
+        print("[Cache MISS] " + master_key + " fetching from YouTube")
+        all_beats = []
+        seen_ids  = set()
 
-    artist_lower = artist.lower()
-    beats = []
-    for item in data.get("items", []):
-        vid = item.get("id", {}).get("videoId")
-        if not vid:
-            continue
-        s     = item["snippet"]
-        title = decode(s.get("title", ""))
-        if filter_title and artist_lower not in title.lower():
-            continue
-        t = s.get("thumbnails", {})
-        beats.append({
-            "videoId":   vid,
-            "title":     title,
-            "channel":   decode(s.get("channelTitle", "")),
-            "thumbnail": (
-                t.get("high",   {}).get("url") or
-                t.get("medium", {}).get("url") or
-                "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
-            ),
-        })
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for suffix in PAGE_SUFFIXES:
+                q    = artist + " type beat " + suffix
+                data = await yt_get(client, YT_SEARCH, {
+                    "part":       "snippet",
+                    "type":       "video",
+                    "maxResults": 10,
+                    "q":          q,
+                    "key":        YT_KEY,
+                })
+                artist_lower = artist.lower()
+                for item in data.get("items", []):
+                    vid = item.get("id", {}).get("videoId")
+                    if not vid or vid in seen_ids:
+                        continue
+                    s     = item["snippet"]
+                    title = decode(s.get("title", ""))
+                    if filter_title and artist_lower not in title.lower():
+                        continue
+                    seen_ids.add(vid)
+                    t = s.get("thumbnails", {})
+                    all_beats.append({
+                        "videoId":   vid,
+                        "title":     title,
+                        "channel":   decode(s.get("channelTitle", "")),
+                        "thumbnail": (
+                            t.get("high",   {}).get("url") or
+                            t.get("medium", {}).get("url") or
+                            "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
+                        ),
+                    })
+
+        master = all_beats
+        await set_cached(db, master_key, master)
+        print("[Cache SET]  " + master_key + " - " + str(len(master)) + " total beats")
+
+    # 3. Slice master into pages of exactly `max` beats
+    start  = (page - 1) * max
+    end    = start + max
+    beats  = master[start:end]
+
+    # Cache this page slice
+    await set_cached(db, page_key, beats)
 
     # 3. Store in MongoDB so next request is free
     await set_cached(db, cache_key, beats)
@@ -386,3 +406,4 @@ async def trending_beats(request: Request):
     print("[Cache SET] trending_1m - " + str(len(beats)) + " beats")
 
     return {"beats": beats, "cached": False}
+# placeholder
