@@ -58,7 +58,7 @@ async def send_activation_email(to_email: str, name: str, code: str, plan: str) 
                 "Content-Type": "application/json",
             },
             json={
-                "from":    "BeatFinder <noreply@beatfinder.app>",
+                "from":    "BeatFinder <onboarding@resend.dev>",
                 "to":      [to_email],
                 "subject": "Your BeatFinder " + plan_label + " Activation Code",
                 "html":    html,
@@ -97,6 +97,8 @@ async def create_checkout(
                 "metadata[user_email]":        user["email"],
                 "metadata[user_name]":         user.get("name", ""),
                 "metadata[plan]":              plan,
+                "payment_method_types[0]":     "card",
+                "custom_text[submit][message]":"Subscribe to BeatFinder",
             },
         )
 
