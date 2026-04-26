@@ -149,13 +149,16 @@ async def connect_stripe(request: Request, user=Depends(get_current_user)):
     if user.get("plan") != "producer":
         raise HTTPException(status_code=403, detail="Producer Pro required")
 
+    # Get or create the Stripe account first
+    account_id = await _get_or_create_stripe_account(user, request)
+
+    # Then create the account link
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # Create Stripe Connect account link
         r = await client.post(
             STRIPE_API + "/account_links",
             auth=(STRIPE_SECRET, ""),
             data={
-                "account":     await _get_or_create_stripe_account(user, request),
+                "account":     account_id,
                 "refresh_url": FRONTEND_URL + "?stripe=refresh",
                 "return_url":  FRONTEND_URL + "?stripe=connected",
                 "type":        "account_onboarding",
