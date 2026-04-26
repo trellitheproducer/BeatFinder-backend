@@ -258,9 +258,20 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid price format")
 
+    # Always look up the producer's current Stripe account from users collection
     producer_account = beat.get("stripe_account_id")
     if not producer_account:
+        producer_doc = await db.users.find_one({"_id": __import__("bson").ObjectId(beat.get("producer_id", ""))})
+        producer_account = producer_doc.get("stripe_account_id") if producer_doc else None
+
+    if not producer_account:
         raise HTTPException(status_code=400, detail="Producer has not connected their Stripe account yet")
+
+    # Also update the beat with the stripe account for future purchases
+    await db.producer_beats.update_one(
+        {"_id": ObjectId(beat_id)},
+        {"$set": {"stripe_account_id": producer_account}}
+    )
 
     price_pence       = int(price_gbp * 100)
     platform_fee_p    = max(1, int(price_pence * PLATFORM_FEE / 100))
@@ -378,6 +389,50 @@ async def my_leases(request: Request, user=Depends(get_current_user)):
         }
         for d in docs
     ]
+
+
+# ── Sync Stripe account to all producer beats ─────────────────────────────────
+
+@router.post("/sync-stripe")
+async def sync_stripe_to_beats(request: Request, user=Depends(get_current_user)):
+    db       = request.app.state.db
+    user_doc = await db.users.find_one({"_id": user["_id"]})
+    account_id = user_doc.get("stripe_account_id") if user_doc else None
+
+    if not account_id:
+        raise HTTPException(status_code=400, detail="No Stripe account connected")
+
+    result = await db.producer_beats.update_many(
+        {"producer_id": str(user["_id"])},
+        {"$set": {"stripe_account_id": account_id}}
+    )
+    return {"success": True, "updated": result.modified_count}
+
+
+# ── Update beat details ───────────────────────────────────────────────────────
+
+@router.post("/beats/{beat_id}/update")
+async def update_beat(beat_id: str, request: Request, user=Depends(get_current_user)):
+    from bson import ObjectId
+    body = await request.json()
+    db   = request.app.state.db
+
+    update_fields = {}
+    if body.get("title"):  update_fields["title"]  = body["title"].strip()
+    if body.get("genre"):  update_fields["genre"]  = body["genre"].strip()
+    if body.get("price"):  update_fields["price"]  = body["price"].strip()
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    result = await db.producer_beats.update_one(
+        {"_id": ObjectId(beat_id), "producer_id": str(user["_id"])},
+        {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Beat not found or not yours")
+
+    return {"success": True}
 
 
 # ── Track download count ───────────────────────────────────────────────────────
