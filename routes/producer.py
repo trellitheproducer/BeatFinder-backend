@@ -184,14 +184,21 @@ async def _get_or_create_stripe_account(user, request):
             STRIPE_API + "/accounts",
             auth=(STRIPE_SECRET, ""),
             data={
-                "type":                  "express",
-                "email":                 user["email"],
-                "capabilities[transfers][requested]": "true",
+                "type":  "express",
+                "email": user["email"],
+                "capabilities[card_payments][requested]": "true",
+                "capabilities[transfers][requested]":     "true",
+                "business_type": "individual",
             },
         )
 
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail="Could not create Stripe account")
+        err_msg = "Could not create Stripe account"
+        try:
+            err_msg = r.json().get("error", {}).get("message", err_msg)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=err_msg)
 
     account_id = r.json()["id"]
     await db.users.update_one(
