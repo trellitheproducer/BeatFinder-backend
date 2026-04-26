@@ -275,7 +275,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request):
             "https://api.resend.com/emails",
             headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
             json={
-                "from":    "BeatFinder <noreply@beatfinder.app>",
+                "from":    "BeatFinder <onboarding@resend.dev>",
                 "to":      [body.email],
                 "subject": "Reset your BeatFinder password",
                 "html":    html,
