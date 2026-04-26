@@ -111,42 +111,49 @@ async def youtube_search(
     # 2. Try master cache - fetch all beats once, slice per page
     master = await get_cached(db, master_key)
     if not master:
-        # Fetch from YouTube using multiple suffixes to get variety
+        # Fetch from YouTube - make 3 calls with different suffixes
         print("[Cache MISS] " + master_key + " fetching from YouTube")
         all_beats = []
         seen_ids  = set()
+        artist_lower = artist.lower()
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for suffix in PAGE_SUFFIXES:
-                q    = artist + " type beat " + suffix
-                data = await yt_get(client, YT_SEARCH, {
-                    "part":       "snippet",
-                    "type":       "video",
-                    "maxResults": 10,
-                    "q":          q,
-                    "key":        YT_KEY,
-                })
-                artist_lower = artist.lower()
-                for item in data.get("items", []):
-                    vid = item.get("id", {}).get("videoId")
-                    if not vid or vid in seen_ids:
-                        continue
-                    s     = item["snippet"]
-                    title = decode(s.get("title", ""))
-                    if filter_title and artist_lower not in title.lower():
-                        continue
-                    seen_ids.add(vid)
-                    t = s.get("thumbnails", {})
-                    all_beats.append({
-                        "videoId":   vid,
-                        "title":     title,
-                        "channel":   decode(s.get("channelTitle", "")),
-                        "thumbnail": (
-                            t.get("high",   {}).get("url") or
-                            t.get("medium", {}).get("url") or
-                            "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
-                        ),
+        # Use only 3 suffixes to keep it fast (3 x 50 results = up to 150 unique beats)
+        fetch_suffixes = ["free", "free instrumental 2024", "free instrumental 2025"]
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for suffix in fetch_suffixes:
+                try:
+                    q    = artist + " type beat " + suffix
+                    data = await yt_get(client, YT_SEARCH, {
+                        "part":       "snippet",
+                        "type":       "video",
+                        "maxResults": 50,
+                        "q":          q,
+                        "key":        YT_KEY,
                     })
+                    for item in data.get("items", []):
+                        vid = item.get("id", {}).get("videoId")
+                        if not vid or vid in seen_ids:
+                            continue
+                        s     = item["snippet"]
+                        title = decode(s.get("title", ""))
+                        if filter_title and artist_lower not in title.lower():
+                            continue
+                        seen_ids.add(vid)
+                        t = s.get("thumbnails", {})
+                        all_beats.append({
+                            "videoId":   vid,
+                            "title":     title,
+                            "channel":   decode(s.get("channelTitle", "")),
+                            "thumbnail": (
+                                t.get("high",   {}).get("url") or
+                                t.get("medium", {}).get("url") or
+                                "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
+                            ),
+                        })
+                except Exception as e:
+                    print("[Warn] suffix fetch failed: " + str(e))
+                    continue
 
         master = all_beats
         await set_cached(db, master_key, master)
