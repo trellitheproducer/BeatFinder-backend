@@ -83,8 +83,8 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master_v6"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v6"
+    master_key   = artist.lower().replace(" ", "_") + "_master_v7"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v7"
     query        = artist + " type beat"
 
     db = request.app.state.db
@@ -103,18 +103,14 @@ async def youtube_search(
         seen_ids  = set()
         artist_lower = artist.lower()
 
-        # Build fetch queries — extra_queries overrides for specific artists
+        # Original proven fetch suffixes
+        fetch_queries = [
+            artist + " type beat free",
+            artist + " type beat free instrumental 2024",
+            artist + " type beat free instrumental 2025",
+        ]
         if extra_queries:
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
-        else:
-            # Primary proven queries first, then supplemental expansions
-            fetch_queries = [
-                artist + " type beat free",
-                artist + " type beat free instrumental 2024",
-                artist + " type beat free instrumental 2025",
-                artist + " type beat",
-                artist + " Instrumental",
-            ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             for q in fetch_queries:
@@ -132,7 +128,6 @@ async def youtube_search(
                             continue
                         s     = item["snippet"]
                         title = decode(s.get("title", ""))
-                        # filter_title guards against music videos / non-beats
                         if filter_title and artist_lower not in title.lower():
                             continue
                         seen_ids.add(vid)
