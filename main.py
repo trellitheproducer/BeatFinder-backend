@@ -16,6 +16,7 @@ from routes.youtube import router as youtube_router
 from routes.admin import router as admin_router
 from routes.producer import router as producer_router
 from routes.stripe_payments import router as stripe_router
+from routes.lyrics import router as lyrics_router
 
 load_dotenv()
 
@@ -29,10 +30,13 @@ async def lifespan(app: FastAPI):
     # Create indexes for fast cache lookups and TTL expiry
     await app.state.db.yt_cache.create_index("cached_at")
     await app.state.db.yt_cache.create_index([("_id", 1)])
-    print("Cache indexes ready")
+    # Lyrics indexes
+    await app.state.db.lyrics.create_index([("user_id", 1), ("lyric_id", 1)], unique=True)
+    await app.state.db.lyrics.create_index([("user_id", 1), ("updated_at", -1)])
+    print("Indexes ready")
     yield
     app.state.mongo.close()
-    print("🔌 MongoDB disconnected")
+    print("MongoDB disconnected")
 
 
 # ── App ───────────────────────────────────────────────────────────
@@ -58,11 +62,12 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────
-app.include_router(auth_router,    prefix="/api/auth",    tags=["Auth"])
-app.include_router(beats_router,   prefix="/api/beats",   tags=["Saved Beats"])
-app.include_router(youtube_router, prefix="/api/youtube", tags=["YouTube"])
-app.include_router(admin_router,   prefix="/api/admin",   tags=["Admin"])
+app.include_router(auth_router,     prefix="/api/auth",     tags=["Auth"])
+app.include_router(beats_router,    prefix="/api/beats",    tags=["Saved Beats"])
+app.include_router(youtube_router,  prefix="/api/youtube",  tags=["YouTube"])
+app.include_router(admin_router,    prefix="/api/admin",    tags=["Admin"])
 app.include_router(producer_router, prefix="/api/producer", tags=["Producer Beats"])
+app.include_router(lyrics_router,   prefix="/api/lyrics",   tags=["Lyrics"])
 
 # Lease webhook needs raw body - separate route
 from routes.producer import lease_webhook
