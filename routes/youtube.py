@@ -7,11 +7,17 @@ import os
 router = APIRouter()
 
 YT_KEY      = os.getenv("YOUTUBE_API_KEY", "")
+YT_KEY_2    = os.getenv("YOUTUBE_API_KEY_2", "")
 YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search"
 YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
 YT_VIDEOS   = "https://www.googleapis.com/youtube/v3/videos"
 
 CACHE_HOURS = 24
+
+
+def get_active_key():
+    """Return primary key, fall back to secondary if primary is empty."""
+    return YT_KEY or YT_KEY_2
 
 QUOTE = chr(34)
 APOS  = chr(39)
@@ -29,24 +35,45 @@ def decode(text):
     return text
 
 
-async def yt_get(client, url, params):
-    try:
-        r = await client.get(url, params=params)
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timed out")
-    except httpx.RequestError:
-        raise HTTPException(status_code=502, detail="Unreachable")
-    if r.status_code != 200:
+async def yt_get(client, url, params, use_key=None):
+    """Make a YouTube API request, auto-rotating to key 2 if key 1 hits quota."""
+    keys_to_try = []
+    if use_key:
+        keys_to_try = [use_key]
+    else:
+        if YT_KEY:
+            keys_to_try.append(YT_KEY)
+        if YT_KEY_2 and YT_KEY_2 != YT_KEY:
+            keys_to_try.append(YT_KEY_2)
+
+    last_error = None
+    for key in keys_to_try:
+        try:
+            p = dict(params)
+            p["key"] = key
+            r = await client.get(url, params=p)
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Timed out")
+        except httpx.RequestError:
+            raise HTTPException(status_code=502, detail="Unreachable")
+
+        if r.status_code == 200:
+            return r.json()
+
         err    = r.json().get("error", {})
         reason = err.get("errors", [{}])[0].get("reason", "unknown")
+
+        if reason == "quotaExceeded":
+            print("[Quota] Key exhausted, trying next key...")
+            last_error = reason
+            continue  # try next key
         if reason == "keyInvalid":
             raise HTTPException(status_code=401, detail="Invalid API key")
-        if reason == "quotaExceeded":
-            raise HTTPException(status_code=429, detail="Quota exceeded. Resets at midnight PT.")
         if reason == "ipRefererBlocked":
             raise HTTPException(status_code=403, detail="API key restricted")
         raise HTTPException(status_code=r.status_code, detail="YouTube error")
-    return r.json()
+
+    raise HTTPException(status_code=429, detail="All API keys quota exceeded. Resets at midnight PT.")
 
 
 async def get_cached(db, cache_key):
@@ -76,11 +103,11 @@ async def youtube_search(
     filter_title: bool = Query(True),
     extra_queries: Optional[str] = Query(None),
 ):
-    if not YT_KEY:
+    if not YT_KEY and not YT_KEY_2:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master3"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v5"
+    master_key   = artist.lower().replace(" ", "_") + "_master5"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v7"
     query        = artist + " type beat"
 
     db = request.app.state.db
@@ -100,11 +127,7 @@ async def youtube_search(
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
         else:
             fetch_queries = [
-                artist + " type beat free",
-                artist + " type beat free instrumental 2024",
-                artist + " type beat free instrumental 2025",
                 artist + " type beat",
-                artist + " instrumental",
             ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -115,7 +138,6 @@ async def youtube_search(
                         "type":       "video",
                         "maxResults": 50,
                         "q":          q,
-                        "key":        YT_KEY,
                     })
                     for item in data.get("items", []):
                         vid = item.get("id", {}).get("videoId")
@@ -155,7 +177,7 @@ async def youtube_search(
 
 @router.get("/artist-photo")
 async def artist_photo(request: Request, artist: str = Query(...)):
-    if not YT_KEY:
+    if not YT_KEY and not YT_KEY_2:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "photo_" + artist.lower().replace(" ", "_")
@@ -168,7 +190,7 @@ async def artist_photo(request: Request, artist: str = Query(...)):
     async with httpx.AsyncClient(timeout=10.0) as client:
         search_data = await yt_get(client, YT_SEARCH, {
             "part": "snippet", "type": "channel", "maxResults": 1,
-            "q": artist + " official", "key": YT_KEY,
+            "q": artist + " official",
         })
         items = search_data.get("items", [])
         if not items:
@@ -177,7 +199,7 @@ async def artist_photo(request: Request, artist: str = Query(...)):
         if not channel_id:
             return {"artist": artist, "photo": None}
         channel_data = await yt_get(client, YT_CHANNELS, {
-            "part": "snippet", "id": channel_id, "key": YT_KEY,
+            "part": "snippet", "id": channel_id,
         })
         channel_items = channel_data.get("items", [])
         if not channel_items:
@@ -218,7 +240,7 @@ def format_views(n):
 
 @router.get("/trending")
 async def trending_beats(request: Request):
-    if not YT_KEY:
+    if not YT_KEY and not YT_KEY_2:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "trending_1m_v2"
@@ -234,14 +256,14 @@ async def trending_beats(request: Request):
     async with httpx.AsyncClient(timeout=15.0) as client:
         search_data = await yt_get(client, YT_SEARCH, {
             "part": "snippet", "type": "video", "maxResults": 50,
-            "q": "type beat free 2025", "order": "viewCount", "key": YT_KEY,
+            "q": "type beat free 2025", "order": "viewCount",
         })
         items = search_data.get("items", [])
         if not items:
             return {"beats": [], "cached": False}
         video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
         stats_data = await yt_get(client, YT_VIDEOS, {
-            "part": "statistics,snippet", "id": ",".join(video_ids), "key": YT_KEY,
+            "part": "statistics,snippet", "id": ",".join(video_ids),
         })
 
     beats = []
