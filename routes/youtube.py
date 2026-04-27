@@ -8,6 +8,7 @@ router = APIRouter()
 YT_KEY      = os.getenv("YOUTUBE_API_KEY", "")
 YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search"
 YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
+YT_VIDEOS   = "https://www.googleapis.com/youtube/v3/videos"
 
 CACHE_HOURS = 24
 
@@ -17,26 +18,70 @@ AMP   = chr(38)
 LT    = chr(60)
 GT    = chr(62)
 
-PAGE_SUFFIXES = [
-    "free instrumental",
-    "2025 free",
-    "2024 free instrumental",
-    "new 2025",
-    "hard trap instrumental",
-    "melodic instrumental",
-    "free download",
-    "best free",
-    "official instrumental",
-    "2026 free instrumental",
+# ── Instrumental filter ───────────────────────────────────────────────────────
+# These signals in a title mean it is a song/video, NOT an instrumental beat.
+# All matching is case-insensitive (titles are lowercased before checking).
+
+VOCAL_SIGNALS = [
+    # English
+    "official video", "official music video", "music video", "official mv",
+    "official clip", "official audio", "official single", "official hd",
+    "lyrics video", "lyric video", "with lyrics", "audio official",
+    "visualizer", "visual video",
+    "feat.", "ft.", " ft ", " feat ", "featuring",
+    "(clean)", "(explicit)", "(dirty)", "(radio edit)",
+    "sing along", "karaoke", "cover", "remix ft",
+    "out now", "new song", "new single", "new music",
+    "official release", "available now", "stream now",
+    "listen now", "vevo",
+    "dance video", "dance performance", "live performance",
+    "behind the scenes", "making of",
+    "(mv)", "[mv]", "m/v", "music vid", "musicvideo",
+    # Spanish / Portuguese
+    "oficial video", "video oficial", "videoclip oficial",
+    "vid oficial", "clip oficial", "musica oficial",
+    "clipe oficial", "video clipe", "videoclipe",
+    # French
+    "clip officiel", "video officielle",
 ]
+
+BEAT_SIGNALS = [
+    "type beat", "instrumental", "free beat", "beat free",
+    "no copyright", "(free)", "[free]", "rap beat", "trap beat",
+    "drill beat", "r&b beat", "afrobeat beat", "melodic beat",
+    "free instrumental",
+]
+
+
+def is_instrumental(title: str) -> bool:
+    """Return True if the title looks like a genuine beat/instrumental."""
+    if not title:
+        return True
+    t = title.lower()
+    # Vocal/video signals always win — reject even if "type beat" also present
+    if any(s in t for s in VOCAL_SIGNALS):
+        return False
+    # Strong beat signal — keep
+    if any(s in t for s in BEAT_SIGNALS):
+        return True
+    # "Artist - Song" pattern with no beat keyword — reject
+    if " - " in t and not any(w in t for w in ["beat", "instrumental", "free", "prod"]):
+        if any(w in t for w in ["official", "audio", "video", "vevo"]):
+            return False
+    # Very short title with no beat word — likely a song title
+    if not any(w in t for w in ["beat", "instrumental", "free", "prod", "type",
+                                  "drill", "trap", "rnb", "afro"]):
+        if len(t) < 30:
+            return False
+    return True
 
 
 def decode(text):
     text = text.replace("&quot;", QUOTE)
-    text = text.replace("&#39;", APOS)
-    text = text.replace("&amp;", AMP)
-    text = text.replace("&lt;", LT)
-    text = text.replace("&gt;", GT)
+    text = text.replace("&#39;",  APOS)
+    text = text.replace("&amp;",  AMP)
+    text = text.replace("&lt;",   LT)
+    text = text.replace("&gt;",   GT)
     return text
 
 
@@ -63,7 +108,6 @@ async def yt_get(client, url, params):
 # ── MongoDB cache helpers ─────────────────────────────────────────────────────
 
 async def get_cached(db, cache_key):
-    """Return cached beats from MongoDB if fresh, else None."""
     doc = await db.yt_cache.find_one({"_id": cache_key})
     if not doc:
         return None
@@ -74,7 +118,6 @@ async def get_cached(db, cache_key):
 
 
 async def set_cached(db, cache_key, beats):
-    """Store beats in MongoDB with current timestamp."""
     await db.yt_cache.update_one(
         {"_id": cache_key},
         {"$set": {"beats": beats, "cached_at": datetime.utcnow()}},
@@ -95,40 +138,34 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    # Use a master cache per artist that stores all beats, paginate from it
-    master_key   = artist.lower().replace(" ", "_") + "_master"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
+    master_key   = artist.lower().replace(" ", "_") + "_master_v3"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v4"
     query        = artist + " type beat"
-
-    db = request.app.state.db
+    db           = request.app.state.db
 
     # 1. Try page-level cache
     cached = await get_cached(db, page_key)
     if cached:
-        print("[Cache HIT]  " + page_key + " served from MongoDB")
+        print("[Cache HIT]  " + page_key)
         return {"query": query, "total": len(cached), "beats": cached, "cached": True}
 
-    # 2. Try master cache - fetch all beats once, slice per page
+    # 2. Try master cache
     master = await get_cached(db, master_key)
     if not master:
-        # Fetch from YouTube - make 3 calls with different suffixes
-        print("[Cache MISS] " + master_key + " fetching from YouTube")
-        all_beats = []
-        seen_ids  = set()
+        print("[Cache MISS] " + master_key + " - fetching from YouTube")
+        all_beats    = []
+        seen_ids     = set()
         artist_lower = artist.lower()
-
-        # Use only 3 suffixes to keep it fast (3 x 50 results = up to 150 unique beats)
         fetch_suffixes = ["free", "free instrumental 2024", "free instrumental 2025"]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             for suffix in fetch_suffixes:
                 try:
-                    q    = artist + " type beat " + suffix
                     data = await yt_get(client, YT_SEARCH, {
                         "part":       "snippet",
                         "type":       "video",
                         "maxResults": 50,
-                        "q":          q,
+                        "q":          artist + " type beat " + suffix,
                         "key":        YT_KEY,
                     })
                     for item in data.get("items", []):
@@ -137,7 +174,12 @@ async def youtube_search(
                             continue
                         s     = item["snippet"]
                         title = decode(s.get("title", ""))
+                        # Filter: artist name must appear (if filter_title on)
                         if filter_title and artist_lower not in title.lower():
+                            continue
+                        # Filter: must look like an instrumental
+                        if not is_instrumental(title):
+                            print("[Filter] Rejected: " + title)
                             continue
                         seen_ids.add(vid)
                         t = s.get("thumbnails", {})
@@ -157,19 +199,12 @@ async def youtube_search(
 
         master = all_beats
         await set_cached(db, master_key, master)
-        print("[Cache SET]  " + master_key + " - " + str(len(master)) + " total beats")
+        print("[Cache SET]  " + master_key + " - " + str(len(master)) + " beats")
 
-    # 3. Slice master into pages of exactly `max` beats
-    start  = (page - 1) * max
-    end    = start + max
-    beats  = master[start:end]
-
-    # Cache this page slice
+    # 3. Slice into pages
+    start = (page - 1) * max
+    beats = master[start:start + max]
     await set_cached(db, page_key, beats)
-
-    # 3. Store in MongoDB so next request is free
-    await set_cached(db, cache_key, beats)
-    print("[Cache SET]  " + cache_key + " stored " + str(len(beats)) + " beats")
 
     return {"query": query, "total": len(beats), "beats": beats, "cached": False}
 
@@ -177,17 +212,13 @@ async def youtube_search(
 # ── Artist photo ──────────────────────────────────────────────────────────────
 
 @router.get("/artist-photo")
-async def artist_photo(
-    request: Request,
-    artist:  str = Query(...),
-):
+async def artist_photo(request: Request, artist: str = Query(...)):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "photo_" + artist.lower().replace(" ", "_")
     db        = request.app.state.db
 
-    # Check MongoDB cache first
     cached = await get_cached(db, cache_key)
     if cached:
         return {"artist": artist, "photo": cached.get("url")}
@@ -224,13 +255,11 @@ async def artist_photo(
             thumbs.get("default", {}).get("url")
         )
 
-    # Cache the photo URL in MongoDB
     await set_cached(db, cache_key, {"url": photo})
-
     return {"artist": artist, "photo": photo}
 
 
-# ── Cache stats (admin info) ──────────────────────────────────────────────────
+# ── Cache stats ───────────────────────────────────────────────────────────────
 
 @router.get("/cache-stats")
 async def cache_stats(request: Request):
@@ -243,15 +272,10 @@ async def cache_stats(request: Request):
         "total_cached_queries": total,
         "fresh_entries":        fresh,
         "cache_ttl_hours":      CACHE_HOURS,
-        "message":              "Each fresh entry = 0 YouTube API calls saved",
     }
 
 
-# ── Trending beats with view counts ──────────────────────────────────────────
-# Searches for trending type beats, fetches real view counts via Videos API,
-# filters to 1M+ views only, sorts by view count descending.
-
-YT_VIDEOS = "https://www.googleapis.com/youtube/v3/videos"
+# ── Trending beats ────────────────────────────────────────────────────────────
 
 def format_views(n):
     if n >= 1_000_000:
@@ -266,42 +290,39 @@ async def trending_beats(request: Request):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    cache_key = "trending_1m_v2"
-    db = request.app.state.db
+    today     = datetime.utcnow().strftime("%Y-%m-%d")
+    cache_key = "trending_filtered_" + today
+    db        = request.app.state.db
 
     cached = await get_cached(db, cache_key)
     if cached:
-        print("[Cache HIT] trending_1m")
+        print("[Cache HIT] trending")
         return {"beats": cached, "cached": True}
 
-    print("[Cache MISS] trending_1m - fetching from YouTube")
+    print("[Cache MISS] trending - fetching from YouTube")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        # Search for trending type beats
         search_data = await yt_get(client, YT_SEARCH, {
-            "part": "snippet",
-            "type": "video",
+            "part":       "snippet",
+            "type":       "video",
             "maxResults": 50,
-            "q": "type beat free 2025",
-            "order": "viewCount",
-            "key": YT_KEY,
+            "q":          "type beat free 2025",
+            "order":      "viewCount",
+            "key":        YT_KEY,
         })
 
         items = search_data.get("items", [])
         if not items:
             return {"beats": [], "cached": False}
 
-        # Collect video IDs
         video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
 
-        # Fetch view counts from Videos API
         stats_data = await yt_get(client, YT_VIDEOS, {
             "part": "statistics,snippet",
-            "id": ",".join(video_ids),
-            "key": YT_KEY,
+            "id":   ",".join(video_ids),
+            "key":  YT_KEY,
         })
 
-    # Build beats with view counts, filter 1M+
     beats = []
     for item in stats_data.get("items", []):
         vid = item.get("id")
@@ -311,13 +332,18 @@ async def trending_beats(request: Request):
         views = int(stats.get("viewCount", 0))
         if views < 1_000_000:
             continue
-        s = item.get("snippet", {})
+        s     = item.get("snippet", {})
+        title = decode(s.get("title", ""))
+        # Apply instrumental filter
+        if not is_instrumental(title):
+            print("[Filter] Trending rejected: " + title)
+            continue
         t = s.get("thumbnails", {})
         beats.append({
-            "videoId":   vid,
-            "title":     decode(s.get("title", "")),
-            "channel":   decode(s.get("channelTitle", "")),
-            "thumbnail": (
+            "videoId":    vid,
+            "title":      title,
+            "channel":    decode(s.get("channelTitle", "")),
+            "thumbnail":  (
                 t.get("high",   {}).get("url") or
                 t.get("medium", {}).get("url") or
                 "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
@@ -326,91 +352,10 @@ async def trending_beats(request: Request):
             "viewsLabel": format_views(views),
         })
 
-    # Sort by views descending
     beats.sort(key=lambda b: b["views"], reverse=True)
     beats = beats[:10]
 
     await set_cached(db, cache_key, beats)
-    print("[Cache SET] trending_1m - " + str(len(beats)) + " beats with 1M+ views")
+    print("[Cache SET] trending - " + str(len(beats)) + " filtered beats")
 
     return {"beats": beats, "cached": False}
-
-
-YT_VIDEOS = "https://www.googleapis.com/youtube/v3/videos"
-
-def format_views(n):
-    if n >= 1000000:
-        return str(round(n / 1000000, 1)) + "M views"
-    if n >= 1000:
-        return str(round(n / 1000, 1)) + "K views"
-    return str(n) + " views"
-
-
-@router.get("/trending")
-async def trending_beats(request: Request):
-    if not YT_KEY:
-        raise HTTPException(status_code=500, detail="No API key configured")
-
-    cache_key = "trending_1m"
-    db = request.app.state.db
-
-    cached = await get_cached(db, cache_key)
-    if cached:
-        print("[Cache HIT] trending_1m")
-        return {"beats": cached, "cached": True}
-
-    print("[Cache MISS] trending_1m - fetching from YouTube")
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        search_data = await yt_get(client, YT_SEARCH, {
-            "part": "snippet",
-            "type": "video",
-            "maxResults": 50,
-            "q": "type beat free 2025",
-            "order": "viewCount",
-            "key": YT_KEY,
-        })
-
-        items = search_data.get("items", [])
-        if not items:
-            return {"beats": [], "cached": False}
-
-        video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
-
-        stats_data = await yt_get(client, YT_VIDEOS, {
-            "part": "statistics,snippet",
-            "id": ",".join(video_ids),
-            "key": YT_KEY,
-        })
-
-    beats = []
-    for item in stats_data.get("items", []):
-        vid = item.get("id")
-        if not vid:
-            continue
-        stats = item.get("statistics", {})
-        views = int(stats.get("viewCount", 0))
-        if views < 1000000:
-            continue
-        s = item.get("snippet", {})
-        t = s.get("thumbnails", {})
-        beats.append({
-            "videoId":   vid,
-            "title":     decode(s.get("title", "")),
-            "channel":   decode(s.get("channelTitle", "")),
-            "thumbnail": (
-                t.get("high",   {}).get("url") or
-                t.get("medium", {}).get("url") or
-                "https://img.youtube.com/vi/" + vid + "/hqdefault.jpg"
-            ),
-            "views":      views,
-            "viewsLabel": format_views(views),
-        })
-
-    beats.sort(key=lambda b: b["views"], reverse=True)
-
-    await set_cached(db, cache_key, beats)
-    print("[Cache SET] trending_1m - " + str(len(beats)) + " beats")
-
-    return {"beats": beats, "cached": False}
-# placeholder
