@@ -83,8 +83,8 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master_v7"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v7"
+    master_key   = artist.lower().replace(" ", "_") + "_master"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
     query        = artist + " type beat"
 
     db = request.app.state.db
@@ -103,14 +103,19 @@ async def youtube_search(
         seen_ids  = set()
         artist_lower = artist.lower()
 
-        # Original proven fetch suffixes
-        fetch_queries = [
-            artist + " type beat free",
-            artist + " type beat free instrumental 2024",
-            artist + " type beat free instrumental 2025",
-        ]
+        # Build fetch queries — use extra_queries if provided, else full expanded query set
         if extra_queries:
+            # Artist-specific queries passed from frontend
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
+        else:
+            # All existing queries preserved + new targeted suffixes added
+            fetch_queries = [
+                artist + " type beat free",
+                artist + " type beat free instrumental 2024",
+                artist + " type beat free instrumental 2025",
+                artist + " Instrumental",
+                artist + " type beat",
+            ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             for q in fetch_queries:
@@ -128,7 +133,9 @@ async def youtube_search(
                             continue
                         s     = item["snippet"]
                         title = decode(s.get("title", ""))
-                        if filter_title and artist_lower not in title.lower():
+                        # Only apply artist name filter if filter_title is true
+                        # and no extra_queries (extra_queries means we trust the search)
+                        if filter_title and not extra_queries and artist_lower not in title.lower():
                             continue
                         seen_ids.add(vid)
                         t = s.get("thumbnails", {})
