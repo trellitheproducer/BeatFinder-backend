@@ -49,8 +49,6 @@ async def yt_get(client, url, params):
     return r.json()
 
 
-# ── MongoDB cache helpers ─────────────────────────────────────────────────────
-
 async def get_cached(db, cache_key):
     doc = await db.yt_cache.find_one({"_id": cache_key})
     if not doc:
@@ -69,8 +67,6 @@ async def set_cached(db, cache_key, beats):
     )
 
 
-# ── Beat search ───────────────────────────────────────────────────────────────
-
 @router.get("/search")
 async def youtube_search(
     request:      Request,
@@ -83,20 +79,17 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    # *** ONLY CHANGE: version bumped from _master/_v3 to _v7 to bust stale cache ***
-    master_key   = artist.lower().replace(" ", "_") + "_master_v7"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v7"
+    master_key   = artist.lower().replace(" ", "_") + "_master"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
     query        = artist + " type beat"
 
     db = request.app.state.db
 
-    # 1. Try page-level cache
     cached = await get_cached(db, page_key)
     if cached:
         print("[Cache HIT]  " + page_key + " served from MongoDB")
         return {"query": query, "total": len(cached), "beats": cached, "cached": True}
 
-    # 2. Try master cache
     master = await get_cached(db, master_key)
     if not master:
         print("[Cache MISS] " + master_key + " fetching from YouTube")
@@ -104,7 +97,6 @@ async def youtube_search(
         seen_ids  = set()
         artist_lower = artist.lower()
 
-        # *** ONLY CHANGE: 5 suffixes instead of 3, adds instrumental variations ***
         if extra_queries:
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
         else:
@@ -112,8 +104,6 @@ async def youtube_search(
                 artist + " type beat free",
                 artist + " type beat free instrumental 2024",
                 artist + " type beat free instrumental 2025",
-                artist + " type beat",
-                artist + " instrumental",
             ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -154,7 +144,6 @@ async def youtube_search(
         await set_cached(db, master_key, master)
         print("[Cache SET]  " + master_key + " - " + str(len(master)) + " total beats")
 
-    # 3. Slice master into pages of exactly `max` beats
     start  = (page - 1) * max
     end    = start + max
     beats  = master[start:end]
@@ -165,13 +154,8 @@ async def youtube_search(
     return {"query": query, "total": len(beats), "beats": beats, "cached": False}
 
 
-# ── Artist photo ──────────────────────────────────────────────────────────────
-
 @router.get("/artist-photo")
-async def artist_photo(
-    request: Request,
-    artist:  str = Query(...),
-):
+async def artist_photo(request: Request, artist: str = Query(...)):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
@@ -184,29 +168,21 @@ async def artist_photo(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         search_data = await yt_get(client, YT_SEARCH, {
-            "part":       "snippet",
-            "type":       "channel",
-            "maxResults": 1,
-            "q":          artist + " official",
-            "key":        YT_KEY,
+            "part": "snippet", "type": "channel", "maxResults": 1,
+            "q": artist + " official", "key": YT_KEY,
         })
         items = search_data.get("items", [])
         if not items:
             return {"artist": artist, "photo": None}
-
         channel_id = items[0].get("id", {}).get("channelId")
         if not channel_id:
             return {"artist": artist, "photo": None}
-
         channel_data = await yt_get(client, YT_CHANNELS, {
-            "part": "snippet",
-            "id":   channel_id,
-            "key":  YT_KEY,
+            "part": "snippet", "id": channel_id, "key": YT_KEY,
         })
         channel_items = channel_data.get("items", [])
         if not channel_items:
             return {"artist": artist, "photo": None}
-
         thumbs = channel_items[0].get("snippet", {}).get("thumbnails", {})
         photo  = (
             thumbs.get("high",    {}).get("url") or
@@ -217,8 +193,6 @@ async def artist_photo(
     await set_cached(db, cache_key, {"url": photo})
     return {"artist": artist, "photo": photo}
 
-
-# ── Cache stats ───────────────────────────────────────────────────────────────
 
 @router.get("/cache-stats")
 async def cache_stats(request: Request):
@@ -234,8 +208,6 @@ async def cache_stats(request: Request):
         "message":              "Each fresh entry = 0 YouTube API calls saved",
     }
 
-
-# ── Trending beats ────────────────────────────────────────────────────────────
 
 def format_views(n):
     if n >= 1_000_000:
@@ -262,24 +234,15 @@ async def trending_beats(request: Request):
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         search_data = await yt_get(client, YT_SEARCH, {
-            "part":       "snippet",
-            "type":       "video",
-            "maxResults": 50,
-            "q":          "type beat free 2025",
-            "order":      "viewCount",
-            "key":        YT_KEY,
+            "part": "snippet", "type": "video", "maxResults": 50,
+            "q": "type beat free 2025", "order": "viewCount", "key": YT_KEY,
         })
-
         items = search_data.get("items", [])
         if not items:
             return {"beats": [], "cached": False}
-
         video_ids = [i["id"]["videoId"] for i in items if i.get("id", {}).get("videoId")]
-
         stats_data = await yt_get(client, YT_VIDEOS, {
-            "part": "statistics,snippet",
-            "id":   ",".join(video_ids),
-            "key":  YT_KEY,
+            "part": "statistics,snippet", "id": ",".join(video_ids), "key": YT_KEY,
         })
 
     beats = []
@@ -308,8 +271,6 @@ async def trending_beats(request: Request):
 
     beats.sort(key=lambda b: b["views"], reverse=True)
     beats = beats[:10]
-
     await set_cached(db, cache_key, beats)
     print("[Cache SET] trending_1m - " + str(len(beats)) + " beats with 1M+ views")
-
     return {"beats": beats, "cached": False}
