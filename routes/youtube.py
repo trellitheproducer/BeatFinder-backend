@@ -103,16 +103,15 @@ async def youtube_search(
         seen_ids  = set()
         artist_lower = artist.lower()
 
-        # Build fetch queries — use extra_queries if provided, else generic suffixes
+        # Build fetch queries — use extra_queries if provided, else targeted suffix queries
         if extra_queries:
             # Artist-specific queries passed from frontend
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
         else:
-            # Generic suffixes
+            # Always search targeted music-production queries — never bare artist name
             fetch_queries = [
-                artist + " type beat free",
-                artist + " type beat free instrumental 2024",
-                artist + " type beat free instrumental 2025",
+                artist + " Instrumental",
+                artist + " type beat",
             ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
