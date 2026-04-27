@@ -103,13 +103,16 @@ async def youtube_search(
         seen_ids  = set()
         artist_lower = artist.lower()
 
-        # Build fetch queries — use extra_queries if provided, else targeted suffix queries
+        # Build fetch queries — use extra_queries if provided, else full expanded query set
         if extra_queries:
             # Artist-specific queries passed from frontend
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
         else:
-            # Always search targeted music-production queries — never bare artist name
+            # All existing queries preserved + new targeted suffixes added
             fetch_queries = [
+                artist + " type beat free",
+                artist + " type beat free instrumental 2024",
+                artist + " type beat free instrumental 2025",
                 artist + " Instrumental",
                 artist + " type beat",
             ]
