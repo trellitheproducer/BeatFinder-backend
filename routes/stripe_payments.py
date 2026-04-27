@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Request, HTTPException, Depends
 from datetime import datetime
 import httpx
-import secrets
+import hmac
+import hashlib
 import os
 
 from auth import get_current_user
@@ -15,56 +16,50 @@ RESEND_API_KEY     = os.getenv("RESEND_API_KEY", "")
 ARTIST_PRICE_ID   = "price_1TQDoFFHyNSCxas89UpDKiro"
 PRODUCER_PRICE_ID = "price_1TQDpBFHyNSCxas8cktbqw1n"
 
-PRICE_TO_PLAN = {
-    ARTIST_PRICE_ID:   "artist",
-    PRODUCER_PRICE_ID: "producer",
-}
-
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://beat-finder-frontend.vercel.app")
 
 
-def gen_code(plan: str) -> str:
-    prefix = "ART" if plan == "artist" else "PRD"
-    return prefix + "-" + secrets.token_hex(3).upper()
-
-
-async def send_activation_email(to_email: str, name: str, code: str, plan: str) -> bool:
+async def send_welcome_email(to_email: str, name: str, plan: str) -> bool:
     plan_label = "Artist Pro" if plan == "artist" else "Producer Pro"
     html = """
 <div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#0a0a0a;color:white;padding:32px;border-radius:16px">
   <div style="font-size:32px;font-weight:900;letter-spacing:4px;background:linear-gradient(135deg,#C026D3,#9333EA);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px">BEATFINDER</div>
   <div style="color:#888;margin-bottom:24px">The World's #1 Beat Finder App</div>
-  <div style="color:white;font-size:20px;font-weight:700;margin-bottom:8px">Your """ + plan_label + """ is ready!</div>
-  <div style="color:#aaa;margin-bottom:24px">Hi """ + name + """, thank you for subscribing. Use the code below to activate your plan.</div>
+  <div style="color:white;font-size:20px;font-weight:700;margin-bottom:8px">Welcome to """ + plan_label + """!</div>
+  <div style="color:#aaa;margin-bottom:24px">Hi """ + name + """, your subscription is now active. Your account has been automatically upgraded — just open the app and log in to access all your features.</div>
   <div style="background:#1a1a1a;border:2px solid #C026D3;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
-    <div style="color:#888;font-size:13px;margin-bottom:8px">YOUR ACTIVATION CODE</div>
-    <div style="color:#C026D3;font-size:28px;font-weight:900;letter-spacing:6px">""" + code + """</div>
+    <div style="color:#C026D3;font-size:20px;font-weight:900;">✅ Account Upgraded</div>
+    <div style="color:#888;font-size:14px;margin-top:8px">No code needed — you're all set!</div>
   </div>
-  <div style="color:#aaa;font-size:14px;margin-bottom:16px">To activate:</div>
+  <div style="color:#aaa;font-size:14px;margin-bottom:16px">To get started:</div>
   <ol style="color:#aaa;font-size:14px;line-height:2">
     <li>Open BeatFinder</li>
     <li>Go to Profile tab</li>
-    <li>Select your plan and enter the code above</li>
-    <li>Tap Activate with Code</li>
+    <li>Log in to your account</li>
+    <li>Enjoy your """ + plan_label + """ features!</li>
   </ol>
-  <div style="color:#555;font-size:12px;margin-top:24px">This code is single-use only. If you need help contact us at trellitheproducer@gmail.com</div>
+  <div style="color:#555;font-size:12px;margin-top:24px">If you need help contact us at trellitheproducer@gmail.com</div>
 </div>
 """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": "Bearer " + RESEND_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "from":    "BeatFinder <onboarding@resend.dev>",
-                "to":      [to_email],
-                "subject": "Your BeatFinder " + plan_label + " Activation Code",
-                "html":    html,
-            },
-        )
-    return r.status_code == 200
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": "Bearer " + RESEND_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from":    "BeatFinder <onboarding@resend.dev>",
+                    "to":      [to_email],
+                    "subject": "Your BeatFinder " + plan_label + " is now active!",
+                    "html":    html,
+                },
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print("[Email] Failed to send welcome email: " + str(e))
+        return False
 
 
 # ── Create Stripe Checkout Session ───────────────────────────────────────────
@@ -116,10 +111,8 @@ async def stripe_webhook(request: Request):
     payload    = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    # Verify webhook signature
-    import hmac
-    import hashlib
-
+    # Verify Stripe webhook signature — this is the security gate
+    # Only real Stripe payments can pass this check
     try:
         parts     = {p.split("=")[0]: p.split("=")[1] for p in sig_header.split(",")}
         timestamp = parts.get("t", "")
@@ -133,38 +126,99 @@ async def stripe_webhook(request: Request):
 
         if not hmac.compare_digest(expected, signature):
             raise HTTPException(status_code=400, detail="Invalid signature")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Webhook verification failed")
 
-    event = await request.json()
+    event = payload  # already bytes, parse json separately
+    import json
+    try:
+        event = json.loads(payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    if event.get("type") == "checkout.session.completed":
+    db = request.app.state.db
+
+    # ── Subscription created / payment succeeded ──────────────────────────
+    if event.get("type") in ("checkout.session.completed", "invoice.payment_succeeded"):
         session  = event["data"]["object"]
         metadata = session.get("metadata", {})
 
-        user_id    = metadata.get("user_id")
-        user_email = metadata.get("user_email")
+        user_email = metadata.get("user_email") or session.get("customer_email", "")
         user_name  = metadata.get("user_name", "")
-        plan       = metadata.get("plan")
+        plan       = metadata.get("plan", "")
 
-        if not all([user_id, user_email, plan]):
+        # For invoice events, look up the subscription to get metadata
+        if not plan and event.get("type") == "invoice.payment_succeeded":
+            sub_id = session.get("subscription")
+            if sub_id:
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        sr = await client.get(
+                            "https://api.stripe.com/v1/subscriptions/" + sub_id,
+                            auth=(STRIPE_SECRET, ""),
+                        )
+                        sub_data = sr.json()
+                        metadata = sub_data.get("metadata", {})
+                        plan       = metadata.get("plan", "")
+                        user_email = metadata.get("user_email", user_email)
+                        user_name  = metadata.get("user_name", user_name)
+                except Exception as e:
+                    print("[Stripe] Could not fetch subscription: " + str(e))
+
+        if not user_email or not plan:
+            print("[Stripe] Missing email or plan in webhook metadata")
             return {"received": True}
 
-        db   = request.app.state.db
-        code = gen_code(plan)
+        # Upgrade the user directly in MongoDB — no code needed
+        plan_fields = {
+            "plan":         plan,
+            "isPro":        plan == "producer",
+            "isArtistPro":  True,
+            "upgraded_at":  datetime.utcnow(),
+        }
 
-        # Store activation code in MongoDB
-        await db.activation_codes.insert_one({
-            "_id":        code,
-            "plan":       plan,
-            "used":       False,
-            "user_email": user_email,
-            "created_at": datetime.utcnow(),
-        })
+        result = await db.users.update_one(
+            {"email": user_email},
+            {"$set": plan_fields}
+        )
 
-        # Send activation email
-        sent = await send_activation_email(user_email, user_name, code, plan)
+        if result.modified_count > 0:
+            print("[Stripe] Auto-upgraded " + user_email + " to " + plan)
+            # Send welcome email (no code — just confirmation)
+            sent = await send_welcome_email(user_email, user_name, plan)
+            print("[Stripe] Welcome email sent=" + str(sent))
+        else:
+            print("[Stripe] User not found for email: " + user_email)
 
-        print("[Stripe] Payment complete for " + user_email + " plan=" + plan + " code=" + code + " email_sent=" + str(sent))
+    # ── Subscription cancelled ────────────────────────────────────────────
+    elif event.get("type") == "customer.subscription.deleted":
+        session = event["data"]["object"]
+        # Look up customer email from Stripe
+        customer_id = session.get("customer")
+        user_email  = ""
+        if customer_id:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    cr = await client.get(
+                        "https://api.stripe.com/v1/customers/" + customer_id,
+                        auth=(STRIPE_SECRET, ""),
+                    )
+                    user_email = cr.json().get("email", "")
+            except Exception as e:
+                print("[Stripe] Could not fetch customer: " + str(e))
+
+        if user_email:
+            await db.users.update_one(
+                {"email": user_email},
+                {"$set": {
+                    "plan":        "free",
+                    "isPro":       False,
+                    "isArtistPro": False,
+                    "downgraded_at": datetime.utcnow(),
+                }}
+            )
+            print("[Stripe] Downgraded " + user_email + " to free (subscription cancelled)")
 
     return {"received": True}
