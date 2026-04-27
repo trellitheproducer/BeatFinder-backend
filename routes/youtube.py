@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from datetime import datetime, timedelta
+from typing import Optional
 import httpx
 import os
 
@@ -18,70 +19,13 @@ AMP   = chr(38)
 LT    = chr(60)
 GT    = chr(62)
 
-# ── Instrumental filter ───────────────────────────────────────────────────────
-# These signals in a title mean it is a song/video, NOT an instrumental beat.
-# All matching is case-insensitive (titles are lowercased before checking).
-
-VOCAL_SIGNALS = [
-    # English
-    "official video", "official music video", "music video", "official mv",
-    "official clip", "official audio", "official single", "official hd",
-    "lyrics video", "lyric video", "with lyrics", "audio official",
-    "visualizer", "visual video",
-    "feat.", "ft.", " ft ", " feat ", "featuring",
-    "(clean)", "(explicit)", "(dirty)", "(radio edit)",
-    "sing along", "karaoke", "cover", "remix ft",
-    "out now", "new song", "new single", "new music",
-    "official release", "available now", "stream now",
-    "listen now", "vevo",
-    "dance video", "dance performance", "live performance",
-    "behind the scenes", "making of",
-    "(mv)", "[mv]", "m/v", "music vid", "musicvideo",
-    # Spanish / Portuguese
-    "oficial video", "video oficial", "videoclip oficial",
-    "vid oficial", "clip oficial", "musica oficial",
-    "clipe oficial", "video clipe", "videoclipe",
-    # French
-    "clip officiel", "video officielle",
-]
-
-BEAT_SIGNALS = [
-    "type beat", "instrumental", "free beat", "beat free",
-    "no copyright", "(free)", "[free]", "rap beat", "trap beat",
-    "drill beat", "r&b beat", "afrobeat beat", "melodic beat",
-    "free instrumental",
-]
-
-
-def is_instrumental(title: str) -> bool:
-    """Return True if the title looks like a genuine beat/instrumental."""
-    if not title:
-        return True
-    t = title.lower()
-    # Vocal/video signals always win — reject even if "type beat" also present
-    if any(s in t for s in VOCAL_SIGNALS):
-        return False
-    # Strong beat signal — keep
-    if any(s in t for s in BEAT_SIGNALS):
-        return True
-    # "Artist - Song" pattern with no beat keyword — reject
-    if " - " in t and not any(w in t for w in ["beat", "instrumental", "free", "prod"]):
-        if any(w in t for w in ["official", "audio", "video", "vevo"]):
-            return False
-    # Very short title with no beat word — likely a song title
-    if not any(w in t for w in ["beat", "instrumental", "free", "prod", "type",
-                                  "drill", "trap", "rnb", "afro"]):
-        if len(t) < 30:
-            return False
-    return True
-
 
 def decode(text):
     text = text.replace("&quot;", QUOTE)
-    text = text.replace("&#39;",  APOS)
-    text = text.replace("&amp;",  AMP)
-    text = text.replace("&lt;",   LT)
-    text = text.replace("&gt;",   GT)
+    text = text.replace("&#39;", APOS)
+    text = text.replace("&amp;", AMP)
+    text = text.replace("&lt;", LT)
+    text = text.replace("&gt;", GT)
     return text
 
 
@@ -134,38 +78,51 @@ async def youtube_search(
     max:          int  = Query(10, ge=1, le=50),
     page:         int  = Query(1, ge=1, le=10),
     filter_title: bool = Query(True),
+    extra_queries: Optional[str] = Query(None),  # comma-separated extra search terms
 ):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master_v3"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v4"
+    master_key   = artist.lower().replace(" ", "_") + "_master"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
     query        = artist + " type beat"
-    db           = request.app.state.db
+
+    db = request.app.state.db
 
     # 1. Try page-level cache
     cached = await get_cached(db, page_key)
     if cached:
-        print("[Cache HIT]  " + page_key)
+        print("[Cache HIT]  " + page_key + " served from MongoDB")
         return {"query": query, "total": len(cached), "beats": cached, "cached": True}
 
     # 2. Try master cache
     master = await get_cached(db, master_key)
     if not master:
-        print("[Cache MISS] " + master_key + " - fetching from YouTube")
-        all_beats    = []
-        seen_ids     = set()
+        print("[Cache MISS] " + master_key + " fetching from YouTube")
+        all_beats = []
+        seen_ids  = set()
         artist_lower = artist.lower()
-        fetch_suffixes = ["free", "free instrumental 2024", "free instrumental 2025"]
+
+        # Build fetch queries — use extra_queries if provided, else generic suffixes
+        if extra_queries:
+            # Artist-specific queries passed from frontend
+            fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
+        else:
+            # Generic suffixes
+            fetch_queries = [
+                artist + " type beat free",
+                artist + " type beat free instrumental 2024",
+                artist + " type beat free instrumental 2025",
+            ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            for suffix in fetch_suffixes:
+            for q in fetch_queries:
                 try:
                     data = await yt_get(client, YT_SEARCH, {
                         "part":       "snippet",
                         "type":       "video",
                         "maxResults": 50,
-                        "q":          artist + " type beat " + suffix,
+                        "q":          q,
                         "key":        YT_KEY,
                     })
                     for item in data.get("items", []):
@@ -174,12 +131,9 @@ async def youtube_search(
                             continue
                         s     = item["snippet"]
                         title = decode(s.get("title", ""))
-                        # Filter: artist name must appear (if filter_title on)
-                        if filter_title and artist_lower not in title.lower():
-                            continue
-                        # Filter: must look like an instrumental
-                        if not is_instrumental(title):
-                            print("[Filter] Rejected: " + title)
+                        # Only apply artist name filter if filter_title is true
+                        # and no extra_queries (extra_queries means we trust the search)
+                        if filter_title and not extra_queries and artist_lower not in title.lower():
                             continue
                         seen_ids.add(vid)
                         t = s.get("thumbnails", {})
@@ -194,17 +148,20 @@ async def youtube_search(
                             ),
                         })
                 except Exception as e:
-                    print("[Warn] suffix fetch failed: " + str(e))
+                    print("[Warn] query fetch failed: " + str(e))
                     continue
 
         master = all_beats
         await set_cached(db, master_key, master)
-        print("[Cache SET]  " + master_key + " - " + str(len(master)) + " beats")
+        print("[Cache SET]  " + master_key + " - " + str(len(master)) + " total beats")
 
-    # 3. Slice into pages
-    start = (page - 1) * max
-    beats = master[start:start + max]
+    # 3. Slice master into pages
+    start  = (page - 1) * max
+    end    = start + max
+    beats  = master[start:end]
+
     await set_cached(db, page_key, beats)
+    print("[Cache SET]  " + page_key + " stored " + str(len(beats)) + " beats")
 
     return {"query": query, "total": len(beats), "beats": beats, "cached": False}
 
@@ -212,7 +169,10 @@ async def youtube_search(
 # ── Artist photo ──────────────────────────────────────────────────────────────
 
 @router.get("/artist-photo")
-async def artist_photo(request: Request, artist: str = Query(...)):
+async def artist_photo(
+    request: Request,
+    artist:  str = Query(...),
+):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
@@ -272,6 +232,7 @@ async def cache_stats(request: Request):
         "total_cached_queries": total,
         "fresh_entries":        fresh,
         "cache_ttl_hours":      CACHE_HOURS,
+        "message":              "Each fresh entry = 0 YouTube API calls saved",
     }
 
 
@@ -290,16 +251,15 @@ async def trending_beats(request: Request):
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    today     = datetime.utcnow().strftime("%Y-%m-%d")
-    cache_key = "trending_filtered_" + today
-    db        = request.app.state.db
+    cache_key = "trending_1m_v2"
+    db = request.app.state.db
 
     cached = await get_cached(db, cache_key)
     if cached:
-        print("[Cache HIT] trending")
+        print("[Cache HIT] trending_1m")
         return {"beats": cached, "cached": True}
 
-    print("[Cache MISS] trending - fetching from YouTube")
+    print("[Cache MISS] trending_1m - fetching from YouTube")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         search_data = await yt_get(client, YT_SEARCH, {
@@ -332,16 +292,11 @@ async def trending_beats(request: Request):
         views = int(stats.get("viewCount", 0))
         if views < 1_000_000:
             continue
-        s     = item.get("snippet", {})
-        title = decode(s.get("title", ""))
-        # Apply instrumental filter
-        if not is_instrumental(title):
-            print("[Filter] Trending rejected: " + title)
-            continue
+        s = item.get("snippet", {})
         t = s.get("thumbnails", {})
         beats.append({
             "videoId":    vid,
-            "title":      title,
+            "title":      decode(s.get("title", "")),
             "channel":    decode(s.get("channelTitle", "")),
             "thumbnail":  (
                 t.get("high",   {}).get("url") or
@@ -356,6 +311,6 @@ async def trending_beats(request: Request):
     beats = beats[:10]
 
     await set_cached(db, cache_key, beats)
-    print("[Cache SET] trending - " + str(len(beats)) + " filtered beats")
+    print("[Cache SET] trending_1m - " + str(len(beats)) + " beats with 1M+ views")
 
     return {"beats": beats, "cached": False}
