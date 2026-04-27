@@ -104,6 +104,8 @@ async def youtube_search(
                 artist + " type beat free",
                 artist + " type beat free instrumental 2024",
                 artist + " type beat free instrumental 2025",
+                artist + " type beat",
+                artist + " instrumental",
             ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
