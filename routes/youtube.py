@@ -8,16 +8,12 @@ router = APIRouter()
 
 YT_KEY      = os.getenv("YOUTUBE_API_KEY", "")
 YT_KEY_2    = os.getenv("YOUTUBE_API_KEY_2", "")
+YT_KEY_3    = os.getenv("YOUTUBE_API_KEY_3", "")
 YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search"
 YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
 YT_VIDEOS   = "https://www.googleapis.com/youtube/v3/videos"
 
 CACHE_HOURS = 24
-
-
-def get_active_key():
-    """Return primary key, fall back to secondary if primary is empty."""
-    return YT_KEY or YT_KEY_2
 
 QUOTE = chr(34)
 APOS  = chr(39)
@@ -36,17 +32,15 @@ def decode(text):
 
 
 async def yt_get(client, url, params, use_key=None):
-    """Make a YouTube API request, auto-rotating to key 2 if key 1 hits quota."""
-    keys_to_try = []
+    """Make a YouTube API request, auto-rotating through all 3 keys on quota exceeded."""
     if use_key:
         keys_to_try = [use_key]
     else:
-        if YT_KEY:
-            keys_to_try.append(YT_KEY)
-        if YT_KEY_2 and YT_KEY_2 != YT_KEY:
-            keys_to_try.append(YT_KEY_2)
+        keys_to_try = [k for k in [YT_KEY, YT_KEY_2, YT_KEY_3] if k]
+        # deduplicate while preserving order
+        seen = set()
+        keys_to_try = [k for k in keys_to_try if not (k in seen or seen.add(k))]
 
-    last_error = None
     for key in keys_to_try:
         try:
             p = dict(params)
@@ -65,8 +59,7 @@ async def yt_get(client, url, params, use_key=None):
 
         if reason == "quotaExceeded":
             print("[Quota] Key exhausted, trying next key...")
-            last_error = reason
-            continue  # try next key
+            continue
         if reason == "keyInvalid":
             raise HTTPException(status_code=401, detail="Invalid API key")
         if reason == "ipRefererBlocked":
@@ -103,11 +96,11 @@ async def youtube_search(
     filter_title: bool = Query(True),
     extra_queries: Optional[str] = Query(None),
 ):
-    if not YT_KEY and not YT_KEY_2:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master5"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v7"
+    master_key   = artist.lower().replace(" ", "_") + "_master6"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v8"
     query        = artist + " type beat"
 
     db = request.app.state.db
@@ -128,6 +121,7 @@ async def youtube_search(
         else:
             fetch_queries = [
                 artist + " type beat",
+                artist + " instrumental",
             ]
 
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -177,7 +171,7 @@ async def youtube_search(
 
 @router.get("/artist-photo")
 async def artist_photo(request: Request, artist: str = Query(...)):
-    if not YT_KEY and not YT_KEY_2:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "photo_" + artist.lower().replace(" ", "_")
@@ -240,7 +234,7 @@ def format_views(n):
 
 @router.get("/trending")
 async def trending_beats(request: Request):
-    if not YT_KEY and not YT_KEY_2:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "trending_1m_v2"
