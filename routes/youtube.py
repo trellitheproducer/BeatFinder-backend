@@ -83,8 +83,8 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
+    master_key   = artist.lower().replace(" ", "_") + "_master_v5"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v5"
     query        = artist + " type beat"
 
     db = request.app.state.db
@@ -101,14 +101,11 @@ async def youtube_search(
         print("[Cache MISS] " + master_key + " fetching from YouTube")
         all_beats = []
         seen_ids  = set()
-        artist_lower = artist.lower()
 
         # Build fetch queries — use extra_queries if provided, else full expanded query set
         if extra_queries:
-            # Artist-specific queries passed from frontend
             fetch_queries = [q.strip() for q in extra_queries.split(",") if q.strip()]
         else:
-            # All existing queries preserved + new targeted suffixes added
             fetch_queries = [
                 artist + " type beat free",
                 artist + " type beat free instrumental 2024",
@@ -133,10 +130,6 @@ async def youtube_search(
                             continue
                         s     = item["snippet"]
                         title = decode(s.get("title", ""))
-                        # Only apply artist name filter if filter_title is true
-                        # and no extra_queries (extra_queries means we trust the search)
-                        if filter_title and not extra_queries and artist_lower not in title.lower():
-                            continue
                         seen_ids.add(vid)
                         t = s.get("thumbnails", {})
                         all_beats.append({
