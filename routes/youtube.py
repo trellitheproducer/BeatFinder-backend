@@ -79,8 +79,8 @@ async def youtube_search(
     if not YT_KEY:
         raise HTTPException(status_code=500, detail="No API key configured")
 
-    master_key   = artist.lower().replace(" ", "_") + "_master"
-    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v3"
+    master_key   = artist.lower().replace(" ", "_") + "_master2"
+    page_key     = artist.lower().replace(" ", "_") + "_p" + str(page) + "_v4"
     query        = artist + " type beat"
 
     db = request.app.state.db
