@@ -9,6 +9,7 @@ router = APIRouter()
 YT_KEY      = os.getenv("YOUTUBE_API_KEY", "")
 YT_KEY_2    = os.getenv("YOUTUBE_API_KEY_2", "")
 YT_KEY_3    = os.getenv("YOUTUBE_API_KEY_3", "")
+YT_KEY_4    = os.getenv("YOUTUBE_API_KEY_4", "")
 YT_SEARCH   = "https://www.googleapis.com/youtube/v3/search"
 YT_CHANNELS = "https://www.googleapis.com/youtube/v3/channels"
 YT_VIDEOS   = "https://www.googleapis.com/youtube/v3/videos"
@@ -36,7 +37,7 @@ async def yt_get(client, url, params, use_key=None):
     if use_key:
         keys_to_try = [use_key]
     else:
-        keys_to_try = [k for k in [YT_KEY, YT_KEY_2, YT_KEY_3] if k]
+        keys_to_try = [k for k in [YT_KEY, YT_KEY_2, YT_KEY_3, YT_KEY_4] if k]
         # deduplicate while preserving order
         seen = set()
         keys_to_try = [k for k in keys_to_try if not (k in seen or seen.add(k))]
@@ -96,7 +97,7 @@ async def youtube_search(
     filter_title: bool = Query(True),
     extra_queries: Optional[str] = Query(None),
 ):
-    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3 and not YT_KEY_4:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     master_key   = artist.lower().replace(" ", "_") + "_master6"
@@ -171,7 +172,7 @@ async def youtube_search(
 
 @router.get("/artist-photo")
 async def artist_photo(request: Request, artist: str = Query(...)):
-    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3 and not YT_KEY_4:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "photo_" + artist.lower().replace(" ", "_")
@@ -234,7 +235,7 @@ def format_views(n):
 
 @router.get("/trending")
 async def trending_beats(request: Request):
-    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3:
+    if not YT_KEY and not YT_KEY_2 and not YT_KEY_3 and not YT_KEY_4:
         raise HTTPException(status_code=500, detail="No API key configured")
 
     cache_key = "trending_1m_v2"
