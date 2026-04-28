@@ -15,13 +15,14 @@ router = APIRouter()
 
 
 class LyricSave(BaseModel):
-    id:         int               # client-generated timestamp ID
+    id:         int
     title:      str
     text:       str
     beatTitle:  Optional[str] = ""
     beatId:     Optional[str] = ""
     savedAt:    Optional[str] = ""
     updatedAt:  Optional[str] = ""
+    beat:       Optional[dict] = None  # full beat object {videoId, title, channel, thumbnail}
 
 
 # ── List all lyrics for the current user ─────────────────────────
@@ -39,6 +40,7 @@ async def list_lyrics(request: Request, user=Depends(get_current_user)):
             "text":      d.get("text", ""),
             "beatTitle": d.get("beat_title", ""),
             "beatId":    d.get("beat_id", ""),
+            "beat":      d.get("beat", None),
             "savedAt":   d.get("saved_at", ""),
             "updatedAt": d.get("updated_at", ""),
         }
@@ -66,6 +68,7 @@ async def save_lyric(
                 "text":       body.text,
                 "beat_title": body.beatTitle or "",
                 "beat_id":    body.beatId or "",
+                "beat":       body.beat,
                 "saved_at":   body.savedAt or now,
                 "updated_at": body.updatedAt or now,
             }
@@ -123,6 +126,7 @@ async def bulk_import(
             "text":       lyric.get("text", ""),
             "beat_title": lyric.get("beatTitle", ""),
             "beat_id":    lyric.get("beatId", ""),
+            "beat":       lyric.get("beat", None),
             "saved_at":   lyric.get("savedAt", now),
             "updated_at": lyric.get("updatedAt", now),
         })
