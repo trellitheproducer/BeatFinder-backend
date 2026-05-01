@@ -14,7 +14,7 @@ from auth import get_current_user
 router = APIRouter()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 
 
 class SuggestRequest(BaseModel):
@@ -71,6 +71,7 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
         )
 
     if r.status_code != 200:
+        print("[Gemini Error] Status: " + str(r.status_code) + " Body: " + r.text)
         raise HTTPException(status_code=502, detail="AI service error: " + r.text)
 
     data = r.json()
