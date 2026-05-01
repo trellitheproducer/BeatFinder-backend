@@ -15,11 +15,10 @@ router = APIRouter()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Try multiple model endpoints in order until one works
 GEMINI_MODELS = [
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-    "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.0-pro:generateContent",
 ]
 
 
@@ -72,23 +71,21 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
             url = model_url + "?key=" + GEMINI_API_KEY
             try:
                 r = await client.post(url, json=payload)
-                print("[Gemini] Tried " + model_url + " -> " + str(r.status_code))
+                print("[Gemini] " + model_url.split("/models/")[1] + " -> " + str(r.status_code))
                 if r.status_code == 200:
                     data = r.json()
                     try:
                         text = data["candidates"][0]["content"]["parts"][0]["text"]
                         return {"suggestion": text.strip()}
                     except (KeyError, IndexError):
-                        print("[Gemini] Unexpected response: " + str(data))
                         last_error = "Unexpected response format"
                         continue
                 else:
-                    last_error = str(r.status_code) + ": " + r.text
+                    last_error = str(r.status_code) + ": " + r.text[:200]
                     print("[Gemini Error] " + last_error)
                     continue
             except Exception as e:
                 last_error = str(e)
-                print("[Gemini Exception] " + last_error)
                 continue
 
     raise HTTPException(status_code=502, detail="AI unavailable: " + last_error)
