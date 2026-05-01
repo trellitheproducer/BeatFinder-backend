@@ -13,12 +13,13 @@ from auth import get_current_user
 
 router = APIRouter()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY2 = os.getenv("GEMINI_API_KEY2", "")
 
 GEMINI_MODELS = [
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
 ]
 
 
@@ -34,7 +35,9 @@ async def suggest_lyrics(
     request: Request,
     user=Depends(get_current_user),
 ):
-    if not GEMINI_API_KEY:
+    # Try both keys
+    keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY2] if k]
+    if not keys:
         raise HTTPException(status_code=500, detail="AI not configured")
 
     context_parts = []
@@ -67,26 +70,31 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         last_error = ""
-        for model_url in GEMINI_MODELS:
-            url = model_url + "?key=" + GEMINI_API_KEY
-            try:
-                r = await client.post(url, json=payload)
-                model_name = model_url.split("/models/")[1].split(":")[0]
-                print("[Gemini] " + model_name + " -> " + str(r.status_code))
-                if r.status_code == 200:
-                    data = r.json()
-                    try:
-                        text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        return {"suggestion": text.strip()}
-                    except (KeyError, IndexError):
-                        last_error = "Unexpected response format"
+        for api_key in keys:
+            for model_url in GEMINI_MODELS:
+                url = model_url + "?key=" + api_key
+                try:
+                    r = await client.post(url, json=payload)
+                    model_name = model_url.split("/models/")[1].split(":")[0]
+                    print("[Gemini] " + model_name + " -> " + str(r.status_code))
+                    if r.status_code == 200:
+                        data = r.json()
+                        try:
+                            text = data["candidates"][0]["content"]["parts"][0]["text"]
+                            return {"suggestion": text.strip()}
+                        except (KeyError, IndexError):
+                            last_error = "Unexpected response format"
+                            continue
+                    elif r.status_code == 429:
+                        last_error = "quota exceeded"
+                        print("[Gemini] Quota exceeded, trying next...")
+                        break  # try next key
+                    else:
+                        last_error = str(r.status_code) + ": " + r.text[:200]
+                        print("[Gemini Error] " + last_error)
                         continue
-                else:
-                    last_error = str(r.status_code) + ": " + r.text[:300]
-                    print("[Gemini Error] " + last_error)
+                except Exception as e:
+                    last_error = str(e)
                     continue
-            except Exception as e:
-                last_error = str(e)
-                continue
 
     raise HTTPException(status_code=502, detail="AI unavailable: " + last_error)
