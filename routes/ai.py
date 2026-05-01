@@ -16,9 +16,9 @@ router = APIRouter()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 GEMINI_MODELS = [
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent",
 ]
 
 
@@ -71,7 +71,8 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
             url = model_url + "?key=" + GEMINI_API_KEY
             try:
                 r = await client.post(url, json=payload)
-                print("[Gemini] " + model_url.split("/models/")[1] + " -> " + str(r.status_code))
+                model_name = model_url.split("/models/")[1].split(":")[0]
+                print("[Gemini] " + model_name + " -> " + str(r.status_code))
                 if r.status_code == 200:
                     data = r.json()
                     try:
@@ -81,7 +82,7 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
                         last_error = "Unexpected response format"
                         continue
                 else:
-                    last_error = str(r.status_code) + ": " + r.text[:200]
+                    last_error = str(r.status_code) + ": " + r.text[:300]
                     print("[Gemini Error] " + last_error)
                     continue
             except Exception as e:
