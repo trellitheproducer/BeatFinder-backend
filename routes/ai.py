@@ -1,6 +1,6 @@
 """
 AI Lyrics Assistant: /api/ai/suggest
-Uses Google Gemini API to help users write lyrics.
+Uses Groq API (free, UK compatible) to help users write lyrics.
 """
 
 from fastapi import APIRouter, Request, Depends, HTTPException
@@ -13,14 +13,9 @@ from auth import get_current_user
 
 router = APIRouter()
 
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_API_KEY2 = os.getenv("GEMINI_API_KEY2", "")
-
-GEMINI_MODELS = [
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama3-8b-8192"
 
 
 class SuggestRequest(BaseModel):
@@ -35,9 +30,7 @@ async def suggest_lyrics(
     request: Request,
     user=Depends(get_current_user),
 ):
-    # Try both keys
-    keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY2] if k]
-    if not keys:
+    if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="AI not configured")
 
     context_parts = []
@@ -58,43 +51,33 @@ Your job is to help artists write lyrics. Keep responses concise and creative.
 - Don't add unnecessary explanation unless asked
 - Keep suggestions focused and actionable"""
 
-    full_prompt = system_prompt + "\n\n" + "\n".join(context_parts)
-
-    payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {
-            "temperature":     0.9,
-            "maxOutputTokens": 500,
-        },
-    }
-
     async with httpx.AsyncClient(timeout=20.0) as client:
-        last_error = ""
-        for api_key in keys:
-            for model_url in GEMINI_MODELS:
-                url = model_url + "?key=" + api_key
-                try:
-                    r = await client.post(url, json=payload)
-                    model_name = model_url.split("/models/")[1].split(":")[0]
-                    print("[Gemini] " + model_name + " -> " + str(r.status_code))
-                    if r.status_code == 200:
-                        data = r.json()
-                        try:
-                            text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            return {"suggestion": text.strip()}
-                        except (KeyError, IndexError):
-                            last_error = "Unexpected response format"
-                            continue
-                    elif r.status_code == 429:
-                        last_error = "quota exceeded"
-                        print("[Gemini] Quota exceeded, trying next...")
-                        break  # try next key
-                    else:
-                        last_error = str(r.status_code) + ": " + r.text[:200]
-                        print("[Gemini Error] " + last_error)
-                        continue
-                except Exception as e:
-                    last_error = str(e)
-                    continue
+        r = await client.post(
+            GROQ_URL,
+            headers={
+                "Authorization": "Bearer " + GROQ_API_KEY,
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": "\n".join(context_parts)},
+                ],
+                "max_tokens":  500,
+                "temperature": 0.9,
+            },
+        )
 
-    raise HTTPException(status_code=502, detail="AI unavailable: " + last_error)
+    print("[Groq] Status: " + str(r.status_code))
+
+    if r.status_code != 200:
+        print("[Groq Error] " + r.text[:300])
+        raise HTTPException(status_code=502, detail="AI service error: " + r.text[:200])
+
+    data = r.json()
+    try:
+        text = data["choices"][0]["message"]["content"]
+        return {"suggestion": text.strip()}
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Unexpected AI response format")
