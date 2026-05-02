@@ -35,21 +35,28 @@ async def suggest_lyrics(
 
     context_parts = []
     if body.beatTitle:
-        context_parts.append("The user is writing lyrics to this beat: \"" + body.beatTitle + "\".")
+        context_parts.append("Beat: \"" + body.beatTitle + "\"")
     if body.lyrics and body.lyrics.strip():
-        context_parts.append("Here are the lyrics they have written so far:\n\n" + body.lyrics.strip())
+        lines = [l for l in body.lyrics.strip().split("\n") if l.strip()]
+        if lines:
+            last_line = lines[-1].strip()
+            context_parts.append("Their lyrics so far:\n" + body.lyrics.strip())
+            context_parts.append("LAST LINE (rhyme with this): \"" + last_line + "\"")
+            context_parts.append("Write ONE line that rhymes with: \"" + last_line + "\"")
+        else:
+            context_parts.append("They haven't written any lyrics yet. Write an opening line.")
     else:
-        context_parts.append("They haven't written any lyrics yet.")
-    context_parts.append("User request: " + body.prompt)
+        context_parts.append("They haven't written any lyrics yet. Write a strong opening line.")
 
-    system_prompt = """You are an expert music lyricist and creative writing assistant specialising in rap, R&B, UK drill, grime, afrobeats and melodic trap.
+    system_prompt = """You are an expert rap and R&B lyricist. Your ONLY job is to suggest the next line that RHYMES with the last line the user wrote.
 
-Your job is to help artists write lyrics. Keep responses concise and creative.
-- When suggesting lines or verses, format them clearly with line breaks
-- Match the energy and style of what the user has already written
-- Be creative, authentic and street-aware
-- Don't add unnecessary explanation unless asked
-- Keep suggestions focused and actionable"""
+STRICT RULES:
+- Suggest ONE line only — no explanations, no labels, no asterisks, no headers
+- The line MUST rhyme with the last line the user wrote
+- Match the flow, syllable count and energy of their existing lyrics
+- Keep it street, authentic and natural
+- Do NOT write "Here's a suggestion:" or any preamble — just the line itself
+- Do NOT use asterisks or markdown formatting"""
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(
