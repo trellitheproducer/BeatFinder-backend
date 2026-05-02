@@ -152,6 +152,13 @@ async def connect_stripe(request: Request, user=Depends(get_current_user)):
     # Get or create the Stripe account first
     account_id = await _get_or_create_stripe_account(user, request)
 
+    # Auto-sync stripe_account_id to ALL existing beats by this producer
+    db = request.app.state.db
+    await db.producer_beats.update_many(
+        {"producer_id": str(user["_id"])},
+        {"$set": {"stripe_account_id": account_id}}
+    )
+
     # Then create the account link
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(
