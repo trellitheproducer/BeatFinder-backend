@@ -9,7 +9,10 @@ from datetime import datetime
 from models import RegisterRequest, LoginRequest, TokenResponse, PlanUpgradeRequest
 from pydantic import BaseModel
 from typing import Optional
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth import hash_password, verify_password, create_token, get_current_user
+
 
 router = APIRouter()
 
