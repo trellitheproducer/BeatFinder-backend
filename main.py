@@ -1,68 +1,90 @@
 """
-BeatFinder API — main.py
-Register all routers here.
-
-Add these lines to your existing main.py (or replace it entirely):
-
-    from routes import auth, beats, youtube, producer, stripe_payments, admin, lyrics, messages
-    
-    app.include_router(auth.router,             prefix="/api/auth")
-    app.include_router(beats.router,            prefix="/api/beats")
-    app.include_router(youtube.router,          prefix="/api/youtube")
-    app.include_router(producer.router,         prefix="/api/producer")
-    app.include_router(stripe_payments.router,  prefix="/api/stripe")
-    app.include_router(admin.router,            prefix="/api/admin")
-    app.include_router(lyrics.router,           prefix="/api/lyrics")       # NEW
-    app.include_router(messages.router,         prefix="/api/messages")     # NEW
-
-MongoDB indexes to create (run once):
-
-    db.follows.create_index([("follower_id", 1), ("following_id", 1)], unique=True)
-    db.messages.create_index([("from_username", 1), ("to_username", 1), ("created_at", -1)])
-    db.messages.create_index([("to_username", 1), ("read", 1)])
-    db.lyrics.create_index([("user_id", 1), ("created_at", -1)])
-    db.users.create_index([("username", 1)], unique=True, sparse=True)
-    db.users.create_index([("email", 1)], unique=True)
+BeatFinder Backend - FastAPI + MongoDB + YouTube Data API
+Deploy to Railway or Render (free tier)
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 import os
 
-from routes import auth, beats, youtube, producer, stripe_payments, admin
-from routes import lyrics, messages   # new modules
+from routes.auth import router as auth_router
+from routes.beats import router as beats_router
+from routes.youtube import router as youtube_router
+from routes.admin import router as admin_router
+from routes.producer import router as producer_router
+from routes.stripe_payments import router as stripe_router
+from routes.lyrics import router as lyrics_router
+from routes.messages import router as messages_router   # NEW
+from routes.ai import router as ai_router
 
-app = FastAPI(title="BeatFinder API")
+load_dotenv()
+
+
+# ── Startup / shutdown ────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.mongo = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
+    app.state.db    = app.state.mongo[os.getenv("MONGODB_DB", "beatfinder")]
+    print("MongoDB connected")
+    await app.state.db.yt_cache.create_index("cached_at")
+    await app.state.db.yt_cache.create_index([("_id", 1)])
+    await app.state.db.lyrics.create_index([("user_id", 1), ("lyric_id", 1)], unique=True)
+    await app.state.db.lyrics.create_index([("user_id", 1), ("updated_at", -1)])
+    await app.state.db.follows.create_index([("follower_id", 1), ("following_id", 1)], unique=True)
+    await app.state.db.messages.create_index([("from_username", 1), ("to_username", 1), ("created_at", -1)])
+    await app.state.db.messages.create_index([("to_username", 1), ("read", 1)])
+    print("Indexes ready")
+    yield
+    app.state.mongo.close()
+    print("MongoDB disconnected")
+
+
+# ── App ───────────────────────────────────────────────────────────
+app = FastAPI(
+    title="BeatFinder API",
+    version="1.0.0",
+    description="Backend for BeatFinder - type beat discovery app",
+    lifespan=lifespan,
+)
+
+# ── CORS ──────────────────────────────────────────────────────────
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:5173"
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DB_NAME   = os.getenv("DB_NAME", "beatfinder")
+# ── Routers ───────────────────────────────────────────────────────
+app.include_router(auth_router,     prefix="/api/auth",     tags=["Auth"])
+app.include_router(beats_router,    prefix="/api/beats",    tags=["Saved Beats"])
+app.include_router(youtube_router,  prefix="/api/youtube",  tags=["YouTube"])
+app.include_router(admin_router,    prefix="/api/admin",    tags=["Admin"])
+app.include_router(producer_router, prefix="/api/producer", tags=["Producer Beats"])
+app.include_router(lyrics_router,   prefix="/api/lyrics",   tags=["Lyrics"])
+app.include_router(messages_router, prefix="/api/messages", tags=["Messages"])
+app.include_router(ai_router,       prefix="/api/ai",       tags=["AI"])
 
-@app.on_event("startup")
-async def startup():
-    client = AsyncIOMotorClient(MONGO_URI)
-    app.state.db = client[DB_NAME]
+# Lease webhook needs raw body - separate route
+from routes.producer import lease_webhook
+app.post("/api/producer/lease-webhook")(lease_webhook)
+app.include_router(stripe_router,   prefix="/api/stripe",   tags=["Stripe Payments"])
 
-# ── Existing routers ──────────────────────────────────────────────
-app.include_router(auth.router,            prefix="/api/auth")
-app.include_router(beats.router,           prefix="/api/beats")
-app.include_router(youtube.router,         prefix="/api/youtube")
-app.include_router(producer.router,        prefix="/api/producer")
-app.include_router(stripe_payments.router, prefix="/api/stripe")
-app.include_router(admin.router,           prefix="/api/admin")
 
-# ── New routers ───────────────────────────────────────────────────
-app.include_router(lyrics.router,   prefix="/api/lyrics")
-app.include_router(messages.router, prefix="/api/messages")
-
+# ── Health ────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "BeatFinder API"}
+    return {"status": "ok", "service": "BeatFinder API v1.0"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
