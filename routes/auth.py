@@ -168,7 +168,7 @@ async def update_profile(body: ProfileUpdateRequest, request: Request, user=Depe
 
 # ── Search users by username ──────────────────────────────────────
 @router.get("/search")
-async def search_users(q: str, request: Request, user=Depends(get_current_user)):
+async def search_users(q: str, request: Request):
     if not q or len(q.strip()) < 2:
         return []
     db      = request.app.state.db
@@ -180,10 +180,11 @@ async def search_users(q: str, request: Request, user=Depends(get_current_user))
 
     return [
         {
-            "username": d.get("username", ""),
-            "name":     d.get("name", ""),
-            "plan":     d.get("plan", "free"),
-            "bio":      d.get("bio", ""),
+            "username":  d.get("username", ""),
+            "name":      d.get("name", ""),
+            "plan":      d.get("plan", "free"),
+            "bio":       d.get("bio", ""),
+            "avatarUrl": d.get("avatarUrl", ""),
         }
         for d in docs if d.get("username")
     ]
