@@ -1,72 +1,433 @@
 """
-JWT auth helpers — used by all protected routes.
+Auth routes: /api/auth/
 """
 
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
-import os
+from fastapi import APIRouter, HTTPException, Request, Depends
+from bson import ObjectId
+from datetime import datetime
 
-SECRET_KEY   = os.getenv("JWT_SECRET", "change-this-in-production-please")
-ALGORITHM    = "HS256"
-TOKEN_EXPIRE = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
+from models import RegisterRequest, LoginRequest, TokenResponse, PlanUpgradeRequest
+from pydantic import BaseModel
+from typing import Optional
+from auth import hash_password, verify_password, create_token, get_current_user
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer      = HTTPBearer()
+router = APIRouter()
 
-
-def hash_password(password: str) -> str:
-    # bcrypt limit is 72 bytes - truncate safely
-    pw = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-    return pwd_context.hash(pw)
+PLANS = {
+    "artist":   {"price_gbp": 4.99, "paypal_link": "https://www.paypal.com/paypalme/trellitheproducer/4.99GBP"},
+    "producer": {"price_gbp": 8.99, "paypal_link": "https://www.paypal.com/paypalme/trellitheproducer/8.99GBP"},
+}
 
 
-def verify_password(plain: str, hashed: str) -> bool:
-    pw = plain.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-    return pwd_context.verify(pw, hashed)
-
-
-def create_token(user_id: str, email: str) -> str:
-    payload = {
-        "sub":   user_id,
-        "email": email,
-        "exp":   datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE),
+def _public(user: dict) -> dict:
+    return {
+        "id":          str(user["_id"]),
+        "name":        user.get("name", ""),
+        "email":       user.get("email", ""),
+        "plan":        user.get("plan", "free"),
+        "username":    user.get("username", ""),
+        "bio":         user.get("bio", ""),
+        "location":    user.get("location", ""),
+        "instagram":   user.get("instagram", ""),
+        "tiktok":      user.get("tiktok", ""),
+        "youtube":     user.get("youtube", ""),
+        "spotify":     user.get("spotify", ""),
+        "website":     user.get("website", ""),
+        "is_admin":    user.get("is_admin", False),
+        "created_at":  user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-        )
+# ── Register ──────────────────────────────────────────────────────
+@router.post("/register", response_model=TokenResponse, status_code=201)
+async def register(body: RegisterRequest, request: Request):
+    db = request.app.state.db
+
+    if len(body.password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password too long. Maximum 72 characters.")
+    if await db.users.find_one({"email": body.email}):
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user_id = str(ObjectId())
+    user = {
+        "_id":        user_id,
+        "name":       body.name,
+        "email":      body.email,
+        "password":   hash_password(body.password),
+        "plan":       "free",
+        "is_admin":   False,
+        "bio":        "",
+        "location":   "",
+        "created_at": datetime.utcnow(),
+    }
+    await db.users.insert_one(user)
+    token = create_token(user_id, body.email)
+    return {"access_token": token, "user": _public(user)}
 
 
-async def get_current_user(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(bearer),
-):
-    """
-    Dependency — inject into any route that needs auth.
-    Returns the decoded token payload {"sub": user_id, "email": ...}
-    """
-    payload = decode_token(credentials.credentials)
+# ── Login ─────────────────────────────────────────────────────────
+@router.post("/login", response_model=TokenResponse)
+async def login(body: LoginRequest, request: Request):
+    db   = request.app.state.db
+    user = await db.users.find_one({"email": body.email})
+    if not user or not verify_password(body.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_token(str(user["_id"]), user["email"])
+    return {"access_token": token, "user": _public(user)}
+
+
+# ── Me ────────────────────────────────────────────────────────────
+@router.get("/me")
+async def me(user=Depends(get_current_user)):
+    return _public(user)
+
+
+# ── Upgrade plan ──────────────────────────────────────────────────
+@router.post("/upgrade")
+async def upgrade_plan(body: PlanUpgradeRequest, request: Request, user=Depends(get_current_user)):
+    if body.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    plan_info = PLANS[body.plan]
+    return {
+        "plan":        body.plan,
+        "price_gbp":   plan_info["price_gbp"],
+        "paypal_link": plan_info["paypal_link"],
+    }
+
+
+# ── Set username ──────────────────────────────────────────────────
+class UsernameRequest(BaseModel):
+    username: str
+
+@router.post("/set-username")
+async def set_username(body: UsernameRequest, request: Request, user=Depends(get_current_user)):
+    username = body.username.strip()
+    if not username or len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if len(username) > 30:
+        raise HTTPException(status_code=400, detail="Username must be under 30 characters")
+
+    import re
+    if not re.match(r"^[a-zA-Z0-9_.]+$", username):
+        raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, dots and underscores")
+
+    db = request.app.state.db
+    existing = await db.users.find_one({"username": username})
+    if existing and str(existing["_id"]) != str(user["_id"]):
+        raise HTTPException(status_code=409, detail="Username already taken")
+
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"username": username}})
+    return {"success": True, "username": username}
+
+
+# ── Save bio ──────────────────────────────────────────────────────
+class BioRequest(BaseModel):
+    bio: str
+
+@router.post("/bio")
+async def save_bio(body: BioRequest, request: Request, user=Depends(get_current_user)):
+    bio = body.bio.strip()[:250]
+    db  = request.app.state.db
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"bio": bio}})
+    return {"success": True, "bio": bio}
+
+
+# ── Update full profile (name, location, socials, bio) ────────────
+class ProfileUpdateRequest(BaseModel):
+    name:      Optional[str] = None
+    location:  Optional[str] = None
+    bio:       Optional[str] = None
+    instagram: Optional[str] = None
+    tiktok:    Optional[str] = None
+    youtube:   Optional[str] = None
+    spotify:   Optional[str] = None
+    website:   Optional[str] = None
+
+@router.post("/profile/update")
+async def update_profile(body: ProfileUpdateRequest, request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    fields = {}
+    if body.name      is not None: fields["name"]      = body.name.strip()[:80]
+    if body.location  is not None: fields["location"]  = body.location.strip()[:100]
+    if body.bio       is not None: fields["bio"]        = body.bio.strip()[:250]
+    if body.instagram is not None: fields["instagram"]  = body.instagram.strip()[:200]
+    if body.tiktok    is not None: fields["tiktok"]     = body.tiktok.strip()[:200]
+    if body.youtube   is not None: fields["youtube"]    = body.youtube.strip()[:200]
+    if body.spotify   is not None: fields["spotify"]    = body.spotify.strip()[:200]
+    if body.website   is not None: fields["website"]    = body.website.strip()[:200]
+
+    if fields:
+        await db.users.update_one({"_id": user["_id"]}, {"$set": fields})
+    return {"success": True, "updated": list(fields.keys())}
+
+
+# ── Search users by username ──────────────────────────────────────
+@router.get("/search")
+async def search_users(q: str, request: Request, user=Depends(get_current_user)):
+    if not q or len(q.strip()) < 2:
+        return []
     db      = request.app.state.db
+    pattern = {"$regex": q.strip(), "$options": "i"}
+    docs    = await db.users.find(
+        {"username": pattern},
+        {"password": 0}
+    ).limit(20).to_list(20)
 
-    user = await db.users.find_one({"_id": payload["sub"]})
+    return [
+        {
+            "username": d.get("username", ""),
+            "name":     d.get("name", ""),
+            "plan":     d.get("plan", "free"),
+            "bio":      d.get("bio", ""),
+        }
+        for d in docs if d.get("username")
+    ]
+
+
+# ── Get public profile ────────────────────────────────────────────
+@router.get("/profile/{username}")
+async def get_public_profile(username: str, request: Request, _user: str = ""):
+    db   = request.app.state.db
+    user = await db.users.find_one({"username": username})
     if not user:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    user_id = str(user["_id"])
+
+    # Beats
+    beats = await db.producer_beats.find(
+        {"producer_id": user_id}
+    ).sort("uploaded_at", -1).to_list(50)
+
+    # Follower/following counts
+    follower_count  = await db.follows.count_documents({"following_id": user_id})
+    following_count = await db.follows.count_documents({"follower_id":  user_id})
+
+    return {
+        "username":       user.get("username"),
+        "name":           user.get("name"),
+        "plan":           user.get("plan", "free"),
+        "bio":            user.get("bio", ""),
+        "location":       user.get("location", ""),
+        "instagram":      user.get("instagram", ""),
+        "tiktok":         user.get("tiktok", ""),
+        "youtube":        user.get("youtube", ""),
+        "spotify":        user.get("spotify", ""),
+        "website":        user.get("website", ""),
+        "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
+        "followerCount":  follower_count,
+        "followingCount": following_count,
+        "isFollowing":    False,  # overridden by authenticated endpoint below
+        "beats": [
+            {
+                "id":        str(b["_id"]),
+                "title":     b.get("title"),
+                "genre":     b.get("genre"),
+                "price":     b.get("price", "free"),
+                "url":       b.get("url"),
+                "downloads": b.get("downloads", 0),
+            }
+            for b in beats
+        ],
+    }
+
+
+# ── Get public profile (authenticated — includes isFollowing) ─────
+@router.get("/profile-auth/{username}")
+async def get_public_profile_auth(username: str, request: Request, current_user=Depends(get_current_user)):
+    db      = request.app.state.db
+    profile = await get_public_profile(username, request)  # reuse logic above
+
+    # Check if current user follows this profile
+    target = await db.users.find_one({"username": username})
+    if target:
+        is_following = await db.follows.find_one({
+            "follower_id":  str(current_user["_id"]),
+            "following_id": str(target["_id"]),
+        }) is not None
+        profile["isFollowing"] = is_following
+
+    return profile
+
+
+# ── Follow / unfollow ─────────────────────────────────────────────
+@router.post("/follow/{username}")
+async def follow_user(username: str, request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return user
+    follower_id  = str(user["_id"])
+    following_id = str(target["_id"])
+
+    if follower_id == following_id:
+        raise HTTPException(status_code=400, detail="Cannot follow yourself")
+
+    await db.follows.update_one(
+        {"follower_id": follower_id, "following_id": following_id},
+        {"$setOnInsert": {
+            "follower_id":  follower_id,
+            "following_id": following_id,
+            "created_at":   datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+    return {"success": True, "following": True}
 
 
-async def get_admin_user(user=Depends(get_current_user)):
-    """Dependency for admin-only routes."""
+@router.delete("/follow/{username}")
+async def unfollow_user(username: str, request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.follows.delete_one({
+        "follower_id":  str(user["_id"]),
+        "following_id": str(target["_id"]),
+    })
+    return {"success": True, "following": False}
+
+
+# ── Change password ───────────────────────────────────────────────
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password:     str
+
+@router.post("/change-password")
+async def change_password(body: ChangePasswordRequest, request: Request, user=Depends(get_current_user)):
+    db = request.app.state.db
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+
+    user_doc = await db.users.find_one({"_id": user["_id"]})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    stored_pw = user_doc.get("password") or user_doc.get("hashed_password", "")
+    if not verify_password(body.current_password, stored_pw):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password": hash_password(body.new_password)}}
+    )
+    return {"success": True, "message": "Password changed successfully"}
+
+
+# ── Forgot / reset password ───────────────────────────────────────
+import secrets as secrets_mod
+import os
+import httpx as httpx_mod
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+FRONTEND_URL   = os.getenv("FRONTEND_URL", "https://beat-finder-frontend.vercel.app")
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token:        str
+    new_password: str
+
+@router.post("/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request):
+    db       = request.app.state.db
+    user_doc = await db.users.find_one({"email": body.email.lower().strip()})
+    if not user_doc:
+        return {"success": True, "message": "If that email exists you will receive a reset link."}
+
+    token      = secrets_mod.token_urlsafe(32)
+    expires_at = datetime.utcnow().timestamp() + 3600
+    await db.password_resets.insert_one({
+        "token": token, "user_id": str(user_doc["_id"]),
+        "email": body.email.lower().strip(), "expires_at": expires_at, "used": False,
+    })
+
+    reset_url = FRONTEND_URL + "?reset_token=" + token
+    html = f"""
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#0a0a0a;color:white;padding:32px;border-radius:16px">
+  <div style="font-size:32px;font-weight:900;letter-spacing:4px;color:#C026D3;margin-bottom:8px">BEATFINDER</div>
+  <div style="color:white;font-size:20px;font-weight:700;margin-bottom:12px">Reset Your Password</div>
+  <div style="color:#aaa;margin-bottom:24px">Click the button below to reset your password. This link expires in 1 hour.</div>
+  <a href='{reset_url}' style="display:block;background:linear-gradient(135deg,#C026D3,#7C3AED);border-radius:12px;color:white;font-weight:800;font-size:16px;padding:16px;text-align:center;text-decoration:none;margin-bottom:24px">Reset My Password</a>
+  <div style="color:#555;font-size:12px">If you didn't request this, ignore this email.</div>
+</div>"""
+
+    async with httpx_mod.AsyncClient(timeout=10.0) as client:
+        await client.post("https://api.resend.com/emails",
+            headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
+            json={"from": "BeatFinder <onboarding@resend.dev>", "to": [body.email],
+                  "subject": "Reset your BeatFinder password", "html": html})
+
+    return {"success": True, "message": "If that email exists you will receive a reset link."}
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetPasswordRequest, request: Request):
+    db  = request.app.state.db
+    doc = await db.password_resets.find_one({"token": body.token, "used": False})
+    if not doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
+    if datetime.utcnow().timestamp() > doc["expires_at"]:
+        raise HTTPException(status_code=400, detail="Reset link has expired.")
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+
+    new_hash = hash_password(body.new_password)
+    await db.users.update_one(
+        {"_id": ObjectId(doc["user_id"])},
+        {"$set": {"password": new_hash}}
+    )
+    await db.password_resets.update_one({"token": body.token}, {"$set": {"used": True}})
+    return {"success": True, "message": "Password reset successfully."}
+
+
+# ── Admin: generate activation codes ─────────────────────────────
+class GenerateCodeRequest(BaseModel):
+    plan:  str
+    count: int = 1
+
+@router.post("/generate-codes")
+async def generate_codes(body: GenerateCodeRequest, request: Request, user=Depends(get_current_user)):
     if not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user
+        raise HTTPException(status_code=403, detail="Admin only")
+    if body.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    import secrets
+    db    = request.app.state.db
+    codes = []
+    for _ in range(body.count):
+        prefix = "ART" if body.plan == "artist" else "PRD"
+        code   = prefix + "-" + secrets.token_hex(3).upper()
+        await db.activation_codes.insert_one({
+            "_id": code, "plan": body.plan, "used": False, "created_at": datetime.utcnow(),
+        })
+        codes.append(code)
+    return {"codes": codes, "plan": body.plan}
+
+
+# ── Activate plan with code ───────────────────────────────────────
+class ActivateRequest(BaseModel):
+    code: str
+
+@router.post("/activate")
+async def activate_plan(body: ActivateRequest, request: Request, user=Depends(get_current_user)):
+    db  = request.app.state.db
+    doc = await db.activation_codes.find_one({"_id": body.code.strip().upper()})
+    if not doc:
+        raise HTTPException(status_code=400, detail="Invalid activation code")
+    if doc.get("used"):
+        raise HTTPException(status_code=400, detail="This code has already been used")
+
+    plan = doc["plan"]
+    await db.activation_codes.update_one(
+        {"_id": body.code.strip().upper()},
+        {"$set": {"used": True, "used_by": str(user["_id"]), "used_at": datetime.utcnow()}}
+    )
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"plan": plan, "upgraded_at": datetime.utcnow()}}
+    )
+    return {"success": True, "plan": plan, "message": plan + " plan activated successfully!"}
