@@ -9,10 +9,7 @@ from datetime import datetime
 from models import RegisterRequest, LoginRequest, TokenResponse, PlanUpgradeRequest
 from pydantic import BaseModel
 from typing import Optional
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth import hash_password, verify_password, create_token, get_current_user
-
 
 router = APIRouter()
 
@@ -38,6 +35,7 @@ def _public(user: dict) -> dict:
         "website":     user.get("website", ""),
         "avatarColor": user.get("avatarColor", ""),
         "avatarUrl":   user.get("avatarUrl", ""),
+        "appleMusic":  user.get("appleMusic", ""),
         "is_admin":    user.get("is_admin", False),
         "created_at":  user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
@@ -223,6 +221,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "website":        user.get("website", ""),
         "avatarColor":    user.get("avatarColor", ""),
         "avatarUrl":      user.get("avatarUrl", ""),
+        "appleMusic":     user.get("appleMusic", ""),
         "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
         "followerCount":  follower_count,
         "followingCount": following_count,
@@ -244,19 +243,56 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Get public profile (authenticated — includes isFollowing) ─────
 @router.get("/profile-auth/{username}")
 async def get_public_profile_auth(username: str, request: Request, current_user=Depends(get_current_user)):
-    db      = request.app.state.db
-    profile = await get_public_profile(username, request)  # reuse logic above
+    db   = request.app.state.db
+    user = await db.users.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    user_id = str(user["_id"])
+
+    beats = await db.producer_beats.find(
+        {"producer_id": user_id}
+    ).sort("uploaded_at", -1).to_list(50)
+
+    follower_count  = await db.follows.count_documents({"following_id": user_id})
+    following_count = await db.follows.count_documents({"follower_id":  user_id})
 
     # Check if current user follows this profile
-    target = await db.users.find_one({"username": username})
-    if target:
-        is_following = await db.follows.find_one({
-            "follower_id":  str(current_user["_id"]),
-            "following_id": str(target["_id"]),
-        }) is not None
-        profile["isFollowing"] = is_following
+    is_following = await db.follows.find_one({
+        "follower_id":  str(current_user["_id"]),
+        "following_id": user_id,
+    }) is not None
 
-    return profile
+    return {
+        "username":       user.get("username"),
+        "name":           user.get("name"),
+        "plan":           user.get("plan", "free"),
+        "bio":            user.get("bio", ""),
+        "location":       user.get("location", ""),
+        "instagram":      user.get("instagram", ""),
+        "tiktok":         user.get("tiktok", ""),
+        "youtube":        user.get("youtube", ""),
+        "spotify":        user.get("spotify", ""),
+        "appleMusic":     user.get("appleMusic", ""),
+        "website":        user.get("website", ""),
+        "avatarUrl":      user.get("avatarUrl", ""),
+        "avatarColor":    user.get("avatarColor", ""),
+        "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
+        "followerCount":  follower_count,
+        "followingCount": following_count,
+        "isFollowing":    is_following,
+        "beats": [
+            {
+                "id":        str(b["_id"]),
+                "title":     b.get("title"),
+                "genre":     b.get("genre"),
+                "price":     b.get("price", "free"),
+                "url":       b.get("url"),
+                "downloads": b.get("downloads", 0),
+            }
+            for b in beats
+        ],
+    }
 
 
 # ── Follow / unfollow ─────────────────────────────────────────────
