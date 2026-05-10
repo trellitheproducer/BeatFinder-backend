@@ -2,7 +2,7 @@
 Auth routes: /api/auth/
 """
 
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, HTTPException, Request, Depends, UploadFile, File
 from bson import ObjectId
 from datetime import datetime
 
@@ -33,6 +33,8 @@ def _public(user: dict) -> dict:
         "youtube":     user.get("youtube", ""),
         "spotify":     user.get("spotify", ""),
         "website":     user.get("website", ""),
+        "avatarColor": user.get("avatarColor", ""),
+        "avatarUrl":   user.get("avatarUrl", ""),
         "is_admin":    user.get("is_admin", False),
         "created_at":  user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
@@ -134,14 +136,15 @@ async def save_bio(body: BioRequest, request: Request, user=Depends(get_current_
 
 # ── Update full profile (name, location, socials, bio) ────────────
 class ProfileUpdateRequest(BaseModel):
-    name:      Optional[str] = None
-    location:  Optional[str] = None
-    bio:       Optional[str] = None
-    instagram: Optional[str] = None
-    tiktok:    Optional[str] = None
-    youtube:   Optional[str] = None
-    spotify:   Optional[str] = None
-    website:   Optional[str] = None
+    name:        Optional[str] = None
+    location:    Optional[str] = None
+    bio:         Optional[str] = None
+    instagram:   Optional[str] = None
+    tiktok:      Optional[str] = None
+    youtube:     Optional[str] = None
+    spotify:     Optional[str] = None
+    website:     Optional[str] = None
+    avatarColor: Optional[str] = None
 
 @router.post("/profile/update")
 async def update_profile(body: ProfileUpdateRequest, request: Request, user=Depends(get_current_user)):
@@ -154,7 +157,8 @@ async def update_profile(body: ProfileUpdateRequest, request: Request, user=Depe
     if body.tiktok    is not None: fields["tiktok"]     = body.tiktok.strip()[:200]
     if body.youtube   is not None: fields["youtube"]    = body.youtube.strip()[:200]
     if body.spotify   is not None: fields["spotify"]    = body.spotify.strip()[:200]
-    if body.website   is not None: fields["website"]    = body.website.strip()[:200]
+    if body.website     is not None: fields["website"]     = body.website.strip()[:200]
+    if body.avatarColor is not None: fields["avatarColor"] = body.avatarColor[:200]
 
     if fields:
         await db.users.update_one({"_id": user["_id"]}, {"$set": fields})
@@ -214,6 +218,8 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "youtube":        user.get("youtube", ""),
         "spotify":        user.get("spotify", ""),
         "website":        user.get("website", ""),
+        "avatarColor":    user.get("avatarColor", ""),
+        "avatarUrl":      user.get("avatarUrl", ""),
         "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
         "followerCount":  follower_count,
         "followingCount": following_count,
@@ -382,6 +388,68 @@ async def reset_password(body: ResetPasswordRequest, request: Request):
     )
     await db.password_resets.update_one({"token": body.token}, {"$set": {"used": True}})
     return {"success": True, "message": "Password reset successfully."}
+
+
+
+# ── Upload profile photo ──────────────────────────────────────────
+@router.post("/avatar")
+async def upload_avatar(
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    import httpx, hashlib, time as _time
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image (JPEG, PNG, etc.)")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large — maximum 5MB")
+
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Image storage not configured")
+
+    timestamp = int(_time.time())
+    folder    = "beatfinder/avatars"
+    public_id = "avatar_" + str(user["_id"])
+
+    # Cloudinary signature
+    to_sign   = f"folder={folder}&public_id={public_id}&timestamp={timestamp}" + api_secret
+    signature = hashlib.sha256(to_sign.encode()).hexdigest()
+
+    upload_url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            upload_url,
+            data={
+                "api_key":   api_key,
+                "timestamp": timestamp,
+                "folder":    folder,
+                "public_id": public_id,
+                "signature": signature,
+            },
+            files={"file": (file.filename, file_bytes, file.content_type)},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Image upload failed: " + resp.text)
+
+    avatar_url = resp.json().get("secure_url", "")
+
+    # Save to user document
+    db = request.app.state.db
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"avatarUrl": avatar_url}}
+    )
+
+    return {"avatarUrl": avatar_url}
 
 
 # ── Admin: generate activation codes ─────────────────────────────
