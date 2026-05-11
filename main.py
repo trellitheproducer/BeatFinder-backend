@@ -18,6 +18,7 @@ from routes.producer import router as producer_router
 from routes.stripe_payments import router as stripe_router
 from routes.lyrics import router as lyrics_router
 from routes.messages import router as messages_router   # NEW
+from routes.content  import router as content_router    # NEW
 from routes.ai import router as ai_router
 
 load_dotenv()
@@ -36,6 +37,9 @@ async def lifespan(app: FastAPI):
     await app.state.db.follows.create_index([("follower_id", 1), ("following_id", 1)], unique=True)
     await app.state.db.messages.create_index([("from_username", 1), ("to_username", 1), ("created_at", -1)])
     await app.state.db.messages.create_index([("to_username", 1), ("read", 1)])
+    await app.state.db.content.create_index([("username", 1), ("type", 1), ("createdAt", -1)])
+    await app.state.db.content_likes.create_index([("contentId", 1), ("username", 1)], unique=True)
+    await app.state.db.content_comments.create_index([("contentId", 1), ("createdAt", 1)])
     print("Indexes ready")
     yield
     app.state.mongo.close()
@@ -72,6 +76,7 @@ app.include_router(admin_router,    prefix="/api/admin",    tags=["Admin"])
 app.include_router(producer_router, prefix="/api/producer", tags=["Producer Beats"])
 app.include_router(lyrics_router,   prefix="/api/lyrics",   tags=["Lyrics"])
 app.include_router(messages_router, prefix="/api/messages", tags=["Messages"])
+app.include_router(content_router,  prefix="/api/content",  tags=["Content"])
 app.include_router(ai_router,       prefix="/api/ai",       tags=["AI"])
 
 # Lease webhook needs raw body - separate route
