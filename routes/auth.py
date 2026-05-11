@@ -528,9 +528,8 @@ async def upload_header(
     timestamp = int(_time.time())
     folder    = "beatfinder/headers"
     public_id = "header_" + str(user["_id"])
-    # Cloudinary transformation: crop to 3:1 banner ratio, width 1200
-    transformation = "c_fill,g_center,w_1200,h_400,q_auto"
 
+    # Sign only folder, public_id, timestamp (NOT transformation)
     to_sign   = f"folder={folder}&public_id={public_id}&timestamp={timestamp}" + api_secret
     signature = hashlib.sha256(to_sign.encode()).hexdigest()
 
@@ -540,12 +539,15 @@ async def upload_header(
         resp = await client.post(
             upload_url,
             data={
-                "api_key":        api_key,
-                "timestamp":      timestamp,
-                "folder":         folder,
-                "public_id":      public_id,
-                "signature":      signature,
-                "transformation": transformation,
+                "api_key":   api_key,
+                "timestamp": timestamp,
+                "folder":    folder,
+                "public_id": public_id,
+                "signature": signature,
+                "crop":      "fill",
+                "gravity":   "center",
+                "width":     1200,
+                "height":    400,
             },
             files={"file": (file.filename, file_bytes, file.content_type)},
         )
