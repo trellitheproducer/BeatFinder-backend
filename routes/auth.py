@@ -20,25 +20,44 @@ PLANS = {
 
 
 def _public(user: dict) -> dict:
+    from datetime import timezone
+    expires_at = user.get("subscription_expires_at")
+    # Active if expires_at is in the future (or not set for legacy free accounts)
+    sub_active = False
+    if expires_at:
+        if isinstance(expires_at, datetime):
+            sub_active = expires_at > datetime.utcnow()
+        else:
+            try:
+                sub_active = float(expires_at) > datetime.utcnow().timestamp()
+            except Exception:
+                sub_active = False
+    plan = user.get("plan", "free")
+    # Free plan users are never "active" via subscription
+    if plan == "free":
+        sub_active = False
     return {
-        "id":          str(user["_id"]),
-        "name":        user.get("name", ""),
-        "email":       user.get("email", ""),
-        "plan":        user.get("plan", "free"),
-        "username":    user.get("username", ""),
-        "bio":         user.get("bio", ""),
-        "location":    user.get("location", ""),
-        "instagram":   user.get("instagram", ""),
-        "tiktok":      user.get("tiktok", ""),
-        "youtube":     user.get("youtube", ""),
-        "spotify":     user.get("spotify", ""),
-        "website":     user.get("website", ""),
-        "avatarColor": user.get("avatarColor", ""),
-        "avatarUrl":   user.get("avatarUrl", ""),
-        "appleMusic":  user.get("appleMusic", ""),
-        "headerUrl":   user.get("headerUrl", ""),
-        "is_admin":    user.get("is_admin", False),
-        "created_at":  user.get("created_at", "").isoformat() if user.get("created_at") else None,
+        "id":                    str(user["_id"]),
+        "name":                  user.get("name", ""),
+        "email":                 user.get("email", ""),
+        "plan":                  plan,
+        "username":              user.get("username", ""),
+        "bio":                   user.get("bio", ""),
+        "location":              user.get("location", ""),
+        "instagram":             user.get("instagram", ""),
+        "tiktok":                user.get("tiktok", ""),
+        "youtube":               user.get("youtube", ""),
+        "spotify":               user.get("spotify", ""),
+        "website":               user.get("website", ""),
+        "avatarColor":           user.get("avatarColor", ""),
+        "avatarUrl":             user.get("avatarUrl", ""),
+        "appleMusic":            user.get("appleMusic", ""),
+        "headerUrl":             user.get("headerUrl", ""),
+        "is_admin":              user.get("is_admin", False),
+        "created_at":            user.get("created_at", "").isoformat() if user.get("created_at") else None,
+        "subscriptionActive":    sub_active,
+        "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
+        "billingInterval":       user.get("billing_interval", "monthly"),
     }
 
 
@@ -216,7 +235,6 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
     follower_count  = await db.follows.count_documents({"following_id": user_id})
     following_count = await db.follows.count_documents({"follower_id":  user_id})
 
-    # Total play count across all beats
     play_count = sum(b.get("playCount", 0) for b in beats)
 
     return {
@@ -238,7 +256,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "followerCount":  follower_count,
         "followingCount": following_count,
         "playCount":      play_count,
-        "isFollowing":    False,  # overridden by authenticated endpoint below
+        "isFollowing":    False,
         "beats": [
             {
                 "id":        str(b["_id"]),
@@ -251,6 +269,39 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
             }
             for b in beats
         ],
+    }
+
+
+# ── Subscription status (called after Stripe redirect + on app load) ─
+@router.get("/subscription-status")
+async def subscription_status(request: Request, user=Depends(get_current_user)):
+    db         = request.app.state.db
+    expires_at = user.get("subscription_expires_at")
+    plan       = user.get("plan", "free")
+    sub_active = False
+    if expires_at and plan != "free":
+        if isinstance(expires_at, datetime):
+            sub_active = expires_at > datetime.utcnow()
+        else:
+            try:
+                sub_active = float(expires_at) > datetime.utcnow().timestamp()
+            except Exception:
+                sub_active = False
+    # Auto-downgrade expired subscriptions
+    if not sub_active and plan != "free":
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"plan": "free", "isPro": False, "isArtistPro": False}}
+        )
+        plan = "free"
+    exp_str = None
+    if expires_at:
+        exp_str = expires_at.isoformat() if isinstance(expires_at, datetime) else str(expires_at)
+    return {
+        "plan":                  plan,
+        "subscriptionActive":    sub_active,
+        "subscriptionExpiresAt": exp_str,
+        "billingInterval":       user.get("billing_interval", "monthly"),
     }
 
 
@@ -271,35 +322,48 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
     follower_count  = await db.follows.count_documents({"following_id": user_id})
     following_count = await db.follows.count_documents({"follower_id":  user_id})
 
-    # Total play count across all beats
-    play_count = sum(b.get("playCount", 0) for b in beats)
-
     # Check if current user follows this profile
     is_following = await db.follows.find_one({
         "follower_id":  str(current_user["_id"]),
         "following_id": user_id,
     }) is not None
 
+    play_count = sum(b.get("playCount", 0) for b in beats)
+
+    expires_at = user.get("subscription_expires_at")
+    sub_active = False
+    if expires_at and user.get("plan", "free") != "free":
+        if isinstance(expires_at, datetime):
+            sub_active = expires_at > datetime.utcnow()
+        else:
+            try:
+                sub_active = float(expires_at) > datetime.utcnow().timestamp()
+            except Exception:
+                sub_active = False
+
     return {
-        "username":       user.get("username"),
-        "name":           user.get("name"),
-        "plan":           user.get("plan", "free"),
-        "bio":            user.get("bio", ""),
-        "location":       user.get("location", ""),
-        "instagram":      user.get("instagram", ""),
-        "tiktok":         user.get("tiktok", ""),
-        "youtube":        user.get("youtube", ""),
-        "spotify":        user.get("spotify", ""),
-        "appleMusic":     user.get("appleMusic", ""),
-        "headerUrl":      user.get("headerUrl", ""),
-        "website":        user.get("website", ""),
-        "avatarUrl":      user.get("avatarUrl", ""),
-        "avatarColor":    user.get("avatarColor", ""),
-        "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
-        "followerCount":  follower_count,
-        "followingCount": following_count,
-        "playCount":      play_count,
-        "isFollowing":    is_following,
+        "username":              user.get("username"),
+        "name":                  user.get("name"),
+        "plan":                  user.get("plan", "free"),
+        "bio":                   user.get("bio", ""),
+        "location":              user.get("location", ""),
+        "instagram":             user.get("instagram", ""),
+        "tiktok":                user.get("tiktok", ""),
+        "youtube":               user.get("youtube", ""),
+        "spotify":               user.get("spotify", ""),
+        "appleMusic":            user.get("appleMusic", ""),
+        "headerUrl":             user.get("headerUrl", ""),
+        "website":               user.get("website", ""),
+        "avatarUrl":             user.get("avatarUrl", ""),
+        "avatarColor":           user.get("avatarColor", ""),
+        "joined":                user.get("created_at", "").isoformat() if user.get("created_at") else "",
+        "followerCount":         follower_count,
+        "followingCount":        following_count,
+        "playCount":             play_count,
+        "subscriptionActive":    sub_active,
+        "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
+        "billingInterval":       user.get("billing_interval", "monthly"),
+        "isFollowing":           is_following,
         "beats": [
             {
                 "id":        str(b["_id"]),
@@ -313,42 +377,6 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
             for b in beats
         ],
     }
-
-
-# ── Followers list ────────────────────────────────────────────────
-@router.get("/followers/{username}")
-async def get_followers(username: str, request: Request):
-    db      = request.app.state.db
-    target  = await db.users.find_one({"username": username})
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
-    user_id = str(target["_id"])
-    follows = await db.follows.find({"following_id": user_id}).to_list(500)
-    follower_ids = [f["follower_id"] for f in follows]
-    users = await db.users.find({"_id": {"$in": follower_ids}}, {"password": 0}).to_list(500)
-    return [{"username": u.get("username",""), "name": u.get("name",""), "avatarUrl": u.get("avatarUrl",""), "plan": u.get("plan","free")} for u in users if u.get("username")]
-
-
-# ── Following list ────────────────────────────────────────────────
-@router.get("/following/{username}")
-async def get_following(username: str, request: Request):
-    db      = request.app.state.db
-    target  = await db.users.find_one({"username": username})
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
-    user_id = str(target["_id"])
-    follows = await db.follows.find({"follower_id": user_id}).to_list(500)
-    following_ids = [f["following_id"] for f in follows]
-    users = await db.users.find({"_id": {"$in": following_ids}}, {"password": 0}).to_list(500)
-    return [{"username": u.get("username",""), "name": u.get("name",""), "avatarUrl": u.get("avatarUrl",""), "plan": u.get("plan","free")} for u in users if u.get("username")]
-
-
-# ── Record a beat play ────────────────────────────────────────────
-@router.post("/beat-play/{beat_id}")
-async def record_beat_play(beat_id: str, request: Request):
-    db = request.app.state.db
-    await db.producer_beats.update_one({"_id": beat_id}, {"$inc": {"playCount": 1}})
-    return {"ok": True}
 
 
 # ── Follow / unfollow ─────────────────────────────────────────────
