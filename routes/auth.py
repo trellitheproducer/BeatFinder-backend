@@ -36,6 +36,7 @@ def _public(user: dict) -> dict:
         "avatarColor": user.get("avatarColor", ""),
         "avatarUrl":   user.get("avatarUrl", ""),
         "appleMusic":  user.get("appleMusic", ""),
+        "headerUrl":   user.get("headerUrl", ""),
         "is_admin":    user.get("is_admin", False),
         "created_at":  user.get("created_at", "").isoformat() if user.get("created_at") else None,
     }
@@ -144,22 +145,28 @@ class ProfileUpdateRequest(BaseModel):
     tiktok:      Optional[str] = None
     youtube:     Optional[str] = None
     spotify:     Optional[str] = None
+    appleMusic:  Optional[str] = None
     website:     Optional[str] = None
     avatarColor: Optional[str] = None
+    avatarUrl:   Optional[str] = None
+    headerUrl:   Optional[str] = None
 
 @router.post("/profile/update")
 async def update_profile(body: ProfileUpdateRequest, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
     fields = {}
-    if body.name      is not None: fields["name"]      = body.name.strip()[:80]
-    if body.location  is not None: fields["location"]  = body.location.strip()[:100]
-    if body.bio       is not None: fields["bio"]        = body.bio.strip()[:250]
-    if body.instagram is not None: fields["instagram"]  = body.instagram.strip()[:200]
-    if body.tiktok    is not None: fields["tiktok"]     = body.tiktok.strip()[:200]
-    if body.youtube   is not None: fields["youtube"]    = body.youtube.strip()[:200]
-    if body.spotify   is not None: fields["spotify"]    = body.spotify.strip()[:200]
+    if body.name        is not None: fields["name"]        = body.name.strip()[:80]
+    if body.location    is not None: fields["location"]    = body.location.strip()[:100]
+    if body.bio         is not None: fields["bio"]         = body.bio.strip()[:250]
+    if body.instagram   is not None: fields["instagram"]   = body.instagram.strip()[:200]
+    if body.tiktok      is not None: fields["tiktok"]      = body.tiktok.strip()[:200]
+    if body.youtube     is not None: fields["youtube"]     = body.youtube.strip()[:200]
+    if body.spotify     is not None: fields["spotify"]     = body.spotify.strip()[:200]
+    if body.appleMusic  is not None: fields["appleMusic"]  = body.appleMusic.strip()[:200]
     if body.website     is not None: fields["website"]     = body.website.strip()[:200]
     if body.avatarColor is not None: fields["avatarColor"] = body.avatarColor[:200]
+    if body.avatarUrl   is not None: fields["avatarUrl"]   = body.avatarUrl[:500]
+    if body.headerUrl   is not None: fields["headerUrl"]   = body.headerUrl[:500]
 
     if fields:
         await db.users.update_one({"_id": user["_id"]}, {"$set": fields})
@@ -223,6 +230,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "avatarColor":    user.get("avatarColor", ""),
         "avatarUrl":      user.get("avatarUrl", ""),
         "appleMusic":     user.get("appleMusic", ""),
+        "headerUrl":      user.get("headerUrl", ""),
         "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
         "followerCount":  follower_count,
         "followingCount": following_count,
@@ -275,6 +283,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "youtube":        user.get("youtube", ""),
         "spotify":        user.get("spotify", ""),
         "appleMusic":     user.get("appleMusic", ""),
+        "headerUrl":      user.get("headerUrl", ""),
         "website":        user.get("website", ""),
         "avatarUrl":      user.get("avatarUrl", ""),
         "avatarColor":    user.get("avatarColor", ""),
