@@ -1,7 +1,5 @@
 """
 Posts routes: /api/posts
-Twitter/X style status posts with optional image attachments (max 3).
-Also handles music and video posts moved here from content.
 """
 
 from fastapi import APIRouter, Request, Depends, HTTPException, UploadFile, File, Form
@@ -12,6 +10,7 @@ from bson import ObjectId
 import os, httpx, hashlib, time as _time
 
 from auth import get_current_user
+from routes.notifications import create_notification
 
 router = APIRouter()
 
@@ -75,7 +74,6 @@ async def upload_to_cloudinary(file_bytes, filename, content_type, folder, publi
     return resp.json().get("secure_url", "")
 
 
-# ── Get posts for a profile ───────────────────────────────────────
 @router.get("/profile/{username}")
 async def get_profile_posts(username: str, type: str = "status", request: Request = None):
     db   = request.app.state.db
@@ -86,7 +84,6 @@ async def get_profile_posts(username: str, type: str = "status", request: Reques
     return [_post_out(d) for d in docs]
 
 
-# ── Create status post (text + up to 3 images) ───────────────────
 @router.post("/status", status_code=201)
 async def create_status(request: Request, user=Depends(get_current_user)):
     if user.get("plan") not in ("artist", "producer"):
@@ -122,7 +119,6 @@ async def create_status(request: Request, user=Depends(get_current_user)):
     return _post_out(doc)
 
 
-# ── Create music post (Spotify link) ─────────────────────────────
 class MusicPostBody(BaseModel):
     spotifyUrl: str
     caption:    Optional[str] = ""
@@ -178,7 +174,6 @@ async def create_music_post(body: MusicPostBody, request: Request, user=Depends(
     return _post_out(doc)
 
 
-# ── Create video post ─────────────────────────────────────────────
 @router.post("/video", status_code=201)
 async def create_video_post(request: Request, user=Depends(get_current_user)):
     if user.get("plan") not in ("artist", "producer"):
@@ -226,7 +221,6 @@ async def create_video_post(request: Request, user=Depends(get_current_user)):
     return _post_out(doc)
 
 
-# ── Delete post ───────────────────────────────────────────────────
 @router.delete("/{post_id}")
 async def delete_post(post_id: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
@@ -238,7 +232,6 @@ async def delete_post(post_id: str, request: Request, user=Depends(get_current_u
     return {"deleted": True}
 
 
-# ── Like / unlike ─────────────────────────────────────────────────
 @router.post("/{post_id}/like")
 async def like_post(post_id: str, request: Request, user=Depends(get_current_user)):
     db       = request.app.state.db
@@ -250,6 +243,11 @@ async def like_post(post_id: str, request: Request, user=Depends(get_current_use
         return {"liked": False}
     await db.post_likes.insert_one({"postId": post_id, "username": username, "createdAt": datetime.utcnow()})
     await db.posts.update_one({"_id": post_id}, {"$inc": {"likeCount": 1}})
+    # Notify post owner
+    post_doc = await db.posts.find_one({"_id": post_id})
+    if post_doc:
+        await create_notification(db, post_doc.get("username"), username, "like",
+            f"@{username} liked your post")
     return {"liked": True}
 
 
@@ -260,7 +258,6 @@ async def check_liked(post_id: str, request: Request, user=Depends(get_current_u
     return {"liked": bool(hit)}
 
 
-# ── Comments ──────────────────────────────────────────────────────
 class CommentBody(BaseModel):
     text:     str
     parentId: Optional[str] = None
@@ -288,6 +285,11 @@ async def add_comment(post_id: str, body: CommentBody, request: Request, user=De
     }
     await db.post_comments.insert_one(doc)
     await db.posts.update_one({"_id": post_id}, {"$inc": {"commentCount": 1}})
+    # Notify post owner
+    post_doc = await db.posts.find_one({"_id": post_id})
+    if post_doc:
+        await create_notification(db, post_doc.get("username"), user.get("username"), "comment",
+            f"@{user.get('username')} commented: \"{body.text.strip()[:60]}\"")
     return _comment_out(doc)
 
 
