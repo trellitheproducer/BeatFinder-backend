@@ -216,6 +216,9 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
     follower_count  = await db.follows.count_documents({"following_id": user_id})
     following_count = await db.follows.count_documents({"follower_id":  user_id})
 
+    # Total play count across all beats
+    play_count = sum(b.get("playCount", 0) for b in beats)
+
     return {
         "username":       user.get("username"),
         "name":           user.get("name"),
@@ -234,6 +237,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
         "followerCount":  follower_count,
         "followingCount": following_count,
+        "playCount":      play_count,
         "isFollowing":    False,  # overridden by authenticated endpoint below
         "beats": [
             {
@@ -243,6 +247,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
                 "price":     b.get("price", "free"),
                 "url":       b.get("url"),
                 "downloads": b.get("downloads", 0),
+                "playCount": b.get("playCount", 0),
             }
             for b in beats
         ],
@@ -265,6 +270,9 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
 
     follower_count  = await db.follows.count_documents({"following_id": user_id})
     following_count = await db.follows.count_documents({"follower_id":  user_id})
+
+    # Total play count across all beats
+    play_count = sum(b.get("playCount", 0) for b in beats)
 
     # Check if current user follows this profile
     is_following = await db.follows.find_one({
@@ -290,6 +298,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "joined":         user.get("created_at", "").isoformat() if user.get("created_at") else "",
         "followerCount":  follower_count,
         "followingCount": following_count,
+        "playCount":      play_count,
         "isFollowing":    is_following,
         "beats": [
             {
@@ -299,10 +308,47 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
                 "price":     b.get("price", "free"),
                 "url":       b.get("url"),
                 "downloads": b.get("downloads", 0),
+                "playCount": b.get("playCount", 0),
             }
             for b in beats
         ],
     }
+
+
+# ── Followers list ────────────────────────────────────────────────
+@router.get("/followers/{username}")
+async def get_followers(username: str, request: Request):
+    db      = request.app.state.db
+    target  = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id = str(target["_id"])
+    follows = await db.follows.find({"following_id": user_id}).to_list(500)
+    follower_ids = [f["follower_id"] for f in follows]
+    users = await db.users.find({"_id": {"$in": follower_ids}}, {"password": 0}).to_list(500)
+    return [{"username": u.get("username",""), "name": u.get("name",""), "avatarUrl": u.get("avatarUrl",""), "plan": u.get("plan","free")} for u in users if u.get("username")]
+
+
+# ── Following list ────────────────────────────────────────────────
+@router.get("/following/{username}")
+async def get_following(username: str, request: Request):
+    db      = request.app.state.db
+    target  = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id = str(target["_id"])
+    follows = await db.follows.find({"follower_id": user_id}).to_list(500)
+    following_ids = [f["following_id"] for f in follows]
+    users = await db.users.find({"_id": {"$in": following_ids}}, {"password": 0}).to_list(500)
+    return [{"username": u.get("username",""), "name": u.get("name",""), "avatarUrl": u.get("avatarUrl",""), "plan": u.get("plan","free")} for u in users if u.get("username")]
+
+
+# ── Record a beat play ────────────────────────────────────────────
+@router.post("/beat-play/{beat_id}")
+async def record_beat_play(beat_id: str, request: Request):
+    db = request.app.state.db
+    await db.producer_beats.update_one({"_id": beat_id}, {"$inc": {"playCount": 1}})
+    return {"ok": True}
 
 
 # ── Follow / unfollow ─────────────────────────────────────────────
