@@ -501,6 +501,69 @@ async def upload_avatar(
     return {"avatarUrl": avatar_url}
 
 
+
+# ── Upload header photo ───────────────────────────────────────────
+@router.post("/header")
+async def upload_header(
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    import httpx, hashlib, time as _time
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large - max 10MB")
+
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Image storage not configured")
+
+    timestamp = int(_time.time())
+    folder    = "beatfinder/headers"
+    public_id = "header_" + str(user["_id"])
+    # Cloudinary transformation: crop to 3:1 banner ratio, width 1200
+    transformation = "c_fill,g_center,w_1200,h_400,q_auto"
+
+    to_sign   = f"folder={folder}&public_id={public_id}&timestamp={timestamp}" + api_secret
+    signature = hashlib.sha256(to_sign.encode()).hexdigest()
+
+    upload_url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            upload_url,
+            data={
+                "api_key":        api_key,
+                "timestamp":      timestamp,
+                "folder":         folder,
+                "public_id":      public_id,
+                "signature":      signature,
+                "transformation": transformation,
+            },
+            files={"file": (file.filename, file_bytes, file.content_type)},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Header upload failed: " + resp.text)
+
+    header_url = resp.json().get("secure_url", "")
+
+    db = request.app.state.db
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"headerUrl": header_url}}
+    )
+
+    return {"headerUrl": header_url}
+
+
 # ── Admin: generate activation codes ─────────────────────────────
 class GenerateCodeRequest(BaseModel):
     plan:  str
