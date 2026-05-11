@@ -76,20 +76,26 @@ class SpotifyBody(BaseModel):
 async def add_music(body: SpotifyBody, request: Request, user=Depends(get_current_user)):
     db = request.app.state.db
 
-    # Build Spotify embed URL from track URL
+    # Build Spotify embed URL — accept track, album, or playlist
     url = body.spotifyUrl.strip()
-    # Accept formats: open.spotify.com/track/ID or spotify:track:ID
-    track_id = None
-    if "spotify.com/track/" in url:
-        track_id = url.split("spotify.com/track/")[1].split("?")[0].split("/")[0]
-    elif "spotify:track:" in url:
-        track_id = url.split("spotify:track:")[1].split("?")[0]
+    content_type = None
+    content_id   = None
 
-    if not track_id:
-        raise HTTPException(status_code=400, detail="Invalid Spotify track URL")
+    for ct in ["track", "album", "playlist", "episode"]:
+        if f"spotify.com/{ct}/" in url:
+            content_type = ct
+            content_id   = url.split(f"spotify.com/{ct}/")[1].split("?")[0].split("/")[0]
+            break
+        if f"spotify:{ct}:" in url:
+            content_type = ct
+            content_id   = url.split(f"spotify:{ct}:")[1].split("?")[0]
+            break
 
-    embed_url   = f"https://open.spotify.com/embed/track/{track_id}"
-    spotify_url = f"https://open.spotify.com/track/{track_id}"
+    if not content_type or not content_id:
+        raise HTTPException(status_code=400, detail="Invalid Spotify URL — paste a track, album or playlist link")
+
+    embed_url   = f"https://open.spotify.com/embed/{content_type}/{content_id}"
+    spotify_url = f"https://open.spotify.com/{content_type}/{content_id}"
 
     # Fetch oEmbed for title/artist/thumbnail
     title = ""; artist = ""; thumbnail = ""
