@@ -268,7 +268,8 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
     follower_count  = await db.follows.count_documents({"following_id": user_id})
     following_count = await db.follows.count_documents({"follower_id":  user_id})
 
-    play_count = sum(b.get("playCount", 0) for b in beats)
+    play_count  = sum(b.get("playCount", 0) for b in beats)
+    track_count = await db.artist_tracks.count_documents({"artist_id": user_id})
 
     return {
         "username":       user.get("username"),
@@ -289,6 +290,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "followerCount":  follower_count,
         "followingCount": following_count,
         "playCount":      play_count,
+        "trackCount":     track_count,
         "isFollowing":    False,
         "beats": [
             {
@@ -302,6 +304,9 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
                 "producer":          user.get("name", user.get("username", "Unknown")),
                 "producer_username": user.get("username", ""),
                 "producer_avatar":   user.get("avatarUrl", ""),
+                "description":       b.get("description", ""),
+                "bpm":               b.get("bpm", 0),
+                "key":               b.get("key", ""),
             }
             for b in beats
         ],
@@ -376,7 +381,8 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "following_id": user_id,
     }) is not None
 
-    play_count = sum(b.get("playCount", 0) for b in beats)
+    play_count  = sum(b.get("playCount", 0) for b in beats)
+    track_count = await db.artist_tracks.count_documents({"artist_id": user_id})
 
     expires_at = user.get("subscription_expires_at")
     sub_active = False
@@ -408,6 +414,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "followerCount":         follower_count,
         "followingCount":        following_count,
         "playCount":             play_count,
+        "trackCount":            track_count,
         "subscriptionActive":    sub_active,
         "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
         "billingInterval":       user.get("billing_interval", "monthly"),
@@ -424,6 +431,9 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
                 "producer":          user.get("name", user.get("username", "Unknown")),
                 "producer_username": user.get("username", ""),
                 "producer_avatar":   user.get("avatarUrl", ""),
+                "description":       b.get("description", ""),
+                "bpm":               b.get("bpm", 0),
+                "key":               b.get("key", ""),
             }
             for b in beats
         ],
@@ -870,3 +880,161 @@ async def get_beat_play_count(beat_id: str, request: Request):
     if not beat:
         raise HTTPException(status_code=404, detail="Beat not found")
     return {"playCount": beat.get("playCount", 0)}
+
+
+# =============================================================================
+# ARTIST TRACKS — upload/list/delete tracks for Artist Pro users
+# Tracks are songs artists have recorded, can tag producer @mentions
+# =============================================================================
+
+import cloudinary.uploader as _cld_up
+import os as _os
+
+_CLOUD_NAME = _os.getenv("CLOUDINARY_CLOUD_NAME","")
+_API_KEY_CLD = _os.getenv("CLOUDINARY_API_KEY","")
+_API_SECRET  = _os.getenv("CLOUDINARY_API_SECRET","")
+
+async def _upload_track_to_cloudinary(data: bytes, filename: str) -> str:
+    import cloudinary
+    cloudinary.config(cloud_name=_CLOUD_NAME, api_key=_API_KEY_CLD, api_secret=_API_SECRET)
+    import asyncio, functools
+    result = await asyncio.get_event_loop().run_in_executor(
+        None,
+        functools.partial(
+            cloudinary.uploader.upload,
+            data,
+            resource_type="video",  # Cloudinary uses "video" for audio too
+            public_id="tracks/" + filename.replace(" ","_"),
+            overwrite=False,
+        )
+    )
+    return result.get("secure_url","")
+
+
+@router.post("/tracks/upload")
+async def upload_track(
+    request: Request,
+    user=Depends(get_current_user),
+    file: UploadFile = File(...),
+):
+    """Artist Pro users upload their recorded tracks (MP3/WAV)."""
+    plan = user.get("plan","free")
+    if plan not in ("artist","producer"):
+        raise HTTPException(status_code=403, detail="Artist Pro plan required to upload tracks")
+
+    allowed = (".mp3",".wav",".m4a",".aac",".ogg")
+    if not any(file.filename.lower().endswith(e) for e in allowed):
+        raise HTTPException(status_code=400, detail="Only MP3/WAV/M4A audio files supported")
+
+    data = await file.read()
+    if len(data) > 80 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum 80MB.")
+
+    url = await _upload_track_to_cloudinary(data, file.filename)
+    if not url:
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+    db = request.app.state.db
+    body = {}
+    # Pull JSON metadata from form field if sent
+    try:
+        form = await request.form()
+        import json as _json
+        meta = _json.loads(form.get("meta","{}"))
+        body = meta
+    except Exception:
+        pass
+
+    doc = {
+        "artist_id":       str(user["_id"]),
+        "artist_username": user.get("username",""),
+        "artist_avatar":   user.get("avatarUrl",""),
+        "artist_name":     user.get("name",""),
+        "title":           body.get("title", file.filename.rsplit(".",1)[0]),
+        "description":     body.get("description","")[:500],
+        "producer_tag":    body.get("producer_tag",""),   # @username of producer
+        "beat_title":      body.get("beat_title",""),     # name of beat used
+        "url":             url,
+        "plays":           0,
+        "uploaded_at":     datetime.utcnow(),
+    }
+    result = await db.artist_tracks.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    return {"success": True, "track": doc}
+
+
+@router.post("/tracks/{track_id}/update")
+async def update_track(track_id: str, request: Request, user=Depends(get_current_user)):
+    db   = request.app.state.db
+    body = await request.json()
+    fields = {}
+    if "title"        in body: fields["title"]        = str(body["title"])[:100]
+    if "description"  in body: fields["description"]  = str(body["description"])[:500]
+    if "producer_tag" in body: fields["producer_tag"] = str(body["producer_tag"])[:50]
+    if "beat_title"   in body: fields["beat_title"]   = str(body["beat_title"])[:100]
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    result = await db.artist_tracks.update_one(
+        {"_id": ObjectId(track_id), "artist_id": str(user["_id"])},
+        {"$set": fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Track not found or not yours")
+    return {"success": True}
+
+
+@router.delete("/tracks/{track_id}")
+async def delete_track(track_id: str, request: Request, user=Depends(get_current_user)):
+    db = request.app.state.db
+    result = await db.artist_tracks.delete_one(
+        {"_id": ObjectId(track_id), "artist_id": str(user["_id"])}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Track not found or not yours")
+    return {"success": True}
+
+
+@router.get("/tracks/profile/{username}")
+async def get_profile_tracks(username: str, request: Request):
+    """Public — get all tracks for a profile."""
+    db     = request.app.state.db
+    tracks = await db.artist_tracks.find(
+        {"artist_username": username}
+    ).sort("uploaded_at", -1).to_list(50)
+    return [
+        {
+            "id":              str(t["_id"]),
+            "title":           t.get("title",""),
+            "description":     t.get("description",""),
+            "producer_tag":    t.get("producer_tag",""),
+            "beat_title":      t.get("beat_title",""),
+            "url":             t.get("url",""),
+            "plays":           t.get("plays",0),
+            "artist_username": t.get("artist_username",""),
+            "artist_avatar":   t.get("artist_avatar",""),
+            "artist_name":     t.get("artist_name",""),
+            "uploaded_at":     t.get("uploaded_at","").isoformat() if t.get("uploaded_at") else "",
+        }
+        for t in tracks
+    ]
+
+
+@router.get("/tracks/my-tracks")
+async def get_my_tracks(request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    tracks = await db.artist_tracks.find(
+        {"artist_id": str(user["_id"])}
+    ).sort("uploaded_at", -1).to_list(50)
+    return [
+        {
+            "id":           str(t["_id"]),
+            "title":        t.get("title",""),
+            "description":  t.get("description",""),
+            "producer_tag": t.get("producer_tag",""),
+            "beat_title":   t.get("beat_title",""),
+            "url":          t.get("url",""),
+            "plays":        t.get("plays",0),
+            "uploaded_at":  t.get("uploaded_at","").isoformat() if t.get("uploaded_at") else "",
+        }
+        for t in tracks
+    ]
