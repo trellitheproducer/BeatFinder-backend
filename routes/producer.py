@@ -455,8 +455,11 @@ async def track_download(beat_id: str, request: Request):
     return {"success": True}
 
 
-# ── Proxy download — streams file with Content-Disposition: attachment ─────────
-# This forces iOS Safari to show "Save to Files" instead of opening a media player.
+# ── Proxy download — forces iOS Safari native download dialog ─────────────────
+# iOS Safari only shows its "Save to Files" / download dialog when:
+#   1. The server responds with Content-Disposition: attachment
+#   2. The browser navigates directly to the URL (window.location.href)
+# Blob/fetch + programmatic click does NOT work on iOS Safari.
 
 from fastapi.responses import StreamingResponse
 import re as _re
@@ -476,31 +479,50 @@ async def proxy_download(beat_id: str, request: Request):
     if not url:
         raise HTTPException(status_code=404, detail="No file for this beat")
 
-    # Safe filename
-    raw_title = beat.get("title", "beat")
+    # Safe filename for Content-Disposition
+    raw_title  = beat.get("title", "beat")
     safe_title = _re.sub(r'[^\w\s\-]', '', raw_title).strip().replace(" ", "_") or "beat"
     filename   = safe_title + ".mp3"
+    # RFC 5987 encoded filename for broad browser support
+    encoded    = filename.encode("utf-8").decode("ascii", errors="replace")
 
-    # Increment download count
+    # Increment download count (fire-and-forget)
     await db.producer_beats.update_one(
         {"_id": ObjectId(beat_id)},
         {"$inc": {"downloads": 1}}
     )
 
-    # Stream file from Cloudinary with attachment header
+    # HEAD the Cloudinary URL first to get Content-Length if available
+    content_length = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            head = await client.head(url)
+            cl   = head.headers.get("content-length")
+            if cl:
+                content_length = cl
+    except Exception:
+        pass
+
     async def generate():
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream("GET", url) as resp:
                 async for chunk in resp.aiter_bytes(65536):
                     yield chunk
 
+    headers = {
+        "Content-Disposition":    f'attachment; filename="{encoded}"',
+        "Content-Type":           "audio/mpeg",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control":          "no-cache, no-store",
+        "Access-Control-Allow-Origin": "*",
+    }
+    if content_length:
+        headers["Content-Length"] = content_length
+
     return StreamingResponse(
         generate(),
         media_type="audio/mpeg",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control":       "no-cache",
-        },
+        headers=headers,
     )
 
 
