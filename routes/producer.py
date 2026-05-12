@@ -90,9 +90,12 @@ async def upload_beat(
         "url":               url,
         "producer":          user.get("name", "Unknown"),
         "producer_id":       str(user["_id"]),
+        "producer_username": user.get("username", ""),
+        "producer_avatar":   user_doc.get("avatarUrl", "") if user_doc else "",
         "stripe_account_id": stripe_account_id,
         "uploaded_at":       datetime.utcnow(),
         "downloads":         0,
+        "playCount":         0,
     }
     result = await db.producer_beats.insert_one(beat)
     beat["_id"] = str(result.inserted_id)
@@ -133,10 +136,11 @@ async def list_producer_beats(request: Request):
             "url":               d.get("url"),
             "producer":          d.get("producer"),
             "producer_id":       d.get("producer_id"),
-            "producer_username": username_map.get(d.get("producer_id", ""), ""),
-            "producer_avatar":   avatar_map.get(d.get("producer_id", ""), ""),
+            "producer_username": username_map.get(d.get("producer_id", ""), d.get("producer_username", "")),
+            "producer_avatar":   avatar_map.get(d.get("producer_id", ""), d.get("producer_avatar", "")),
             "stripe_account_id": d.get("stripe_account_id"),
             "downloads":         d.get("downloads", 0),
+            "playCount":         d.get("playCount", 0),
             "uploaded_at":       d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
         }
         for d in docs
@@ -559,3 +563,36 @@ async def delete_beat(beat_id: str, request: Request, user=Depends(get_current_u
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Beat not found or not yours")
     return {"success": True}
+
+
+# ── One-time backfill: sync producer_avatar onto all existing beats ────────────
+# Call GET /api/producer/backfill-avatars once after deploy to fix existing beats
+# that were uploaded before producer_avatar was stored on the beat document.
+
+@router.get("/backfill-avatars")
+async def backfill_avatars(request: Request, user=Depends(get_current_user)):
+    if user.get("username") != "Trelli":
+        raise HTTPException(status_code=403, detail="Admin only")
+    db   = request.app.state.db
+    docs = await db.producer_beats.find({}).to_list(1000)
+    updated = 0
+    for d in docs:
+        pid = d.get("producer_id")
+        if not pid:
+            continue
+        try:
+            from bson import ObjectId as _ObjId2
+            u = await db.users.find_one({"_id": _ObjId2(pid)}, {"avatarUrl": 1, "username": 1})
+            if u:
+                await db.producer_beats.update_one(
+                    {"_id": d["_id"]},
+                    {"$set": {
+                        "producer_avatar":   u.get("avatarUrl", ""),
+                        "producer_username": u.get("username", ""),
+                        "playCount":         d.get("playCount", 0),
+                    }}
+                )
+                updated += 1
+        except Exception:
+            pass
+    return {"backfilled": updated, "total": len(docs)}
