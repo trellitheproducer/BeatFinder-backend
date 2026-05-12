@@ -572,26 +572,40 @@ async def delete_beat(beat_id: str, request: Request, user=Depends(get_current_u
 async def backfill_avatars(request: Request, key: str = ""):
     if key != "beatfinder_admin":
         raise HTTPException(status_code=403, detail="Invalid key")
+    from bson import ObjectId as _ObjId2
     db   = request.app.state.db
     docs = await db.producer_beats.find({}).to_list(1000)
     updated = 0
+    errors  = []
+
     for d in docs:
         pid = d.get("producer_id")
         if not pid:
+            errors.append({"beat": str(d.get("_id")), "error": "no producer_id"})
             continue
+        u = None
+        # Try ObjectId lookup first, then string lookup as fallback
         try:
-            from bson import ObjectId as _ObjId2
             u = await db.users.find_one({"_id": _ObjId2(pid)}, {"avatarUrl": 1, "username": 1})
-            if u:
-                await db.producer_beats.update_one(
-                    {"_id": d["_id"]},
-                    {"$set": {
-                        "producer_avatar":   u.get("avatarUrl", ""),
-                        "producer_username": u.get("username", ""),
-                        "playCount":         d.get("playCount", 0),
-                    }}
-                )
-                updated += 1
         except Exception:
             pass
-    return {"backfilled": updated, "total": len(docs)}
+        if not u:
+            # producer_id might be stored as plain string username or email
+            u = await db.users.find_one({"_id": pid}, {"avatarUrl": 1, "username": 1})
+        if not u:
+            errors.append({"beat": str(d.get("_id")), "producer_id": pid, "error": "user not found"})
+            continue
+        try:
+            await db.producer_beats.update_one(
+                {"_id": d["_id"]},
+                {"$set": {
+                    "producer_avatar":   u.get("avatarUrl", ""),
+                    "producer_username": u.get("username", ""),
+                    "playCount":         d.get("playCount", 0),
+                }}
+            )
+            updated += 1
+        except Exception as e:
+            errors.append({"beat": str(d.get("_id")), "error": str(e)})
+
+    return {"backfilled": updated, "total": len(docs), "errors": errors}
