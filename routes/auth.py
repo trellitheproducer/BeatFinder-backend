@@ -21,33 +21,6 @@ PLANS = {
 
 def _public(user: dict) -> dict:
     from datetime import timezone
-    # ── Trelli (CEO/owner) always has Producer Pro, never expires ──
-    CEO_USERNAME = "Trelli"
-    if user.get("username") == CEO_USERNAME:
-        return {
-            "id":                    str(user["_id"]),
-            "name":                  user.get("name", ""),
-            "email":                 user.get("email", ""),
-            "plan":                  "producer",
-            "username":              user.get("username", ""),
-            "bio":                   user.get("bio", ""),
-            "location":              user.get("location", ""),
-            "instagram":             user.get("instagram", ""),
-            "tiktok":                user.get("tiktok", ""),
-            "youtube":               user.get("youtube", ""),
-            "spotify":               user.get("spotify", ""),
-            "website":               user.get("website", ""),
-            "avatarColor":           user.get("avatarColor", ""),
-            "avatarUrl":             user.get("avatarUrl", ""),
-            "appleMusic":            user.get("appleMusic", ""),
-            "headerUrl":             user.get("headerUrl", ""),
-            "is_admin":              True,
-            "created_at":            user.get("created_at", "").isoformat() if user.get("created_at") else None,
-            "subscriptionActive":    True,
-            "subscriptionExpiresAt": None,
-            "billingInterval":       "lifetime",
-        }
-
     expires_at = user.get("subscription_expires_at")
     # Active if expires_at is in the future (or not set for legacy free accounts)
     sub_active = False
@@ -63,13 +36,11 @@ def _public(user: dict) -> dict:
     # Free plan users are never "active" via subscription
     if plan == "free":
         sub_active = False
-    # Expired paid plan — treat as free for feature gating
-    effective_plan = plan if sub_active else "free"
     return {
         "id":                    str(user["_id"]),
         "name":                  user.get("name", ""),
         "email":                 user.get("email", ""),
-        "plan":                  effective_plan,
+        "plan":                  plan,
         "username":              user.get("username", ""),
         "bio":                   user.get("bio", ""),
         "location":              user.get("location", ""),
@@ -288,13 +259,15 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
         "isFollowing":    False,
         "beats": [
             {
-                "id":        str(b["_id"]),
-                "title":     b.get("title"),
-                "genre":     b.get("genre"),
-                "price":     b.get("price", "free"),
-                "url":       b.get("url"),
-                "downloads": b.get("downloads", 0),
-                "playCount": b.get("playCount", 0),
+                "id":                str(b["_id"]),
+                "title":             b.get("title"),
+                "genre":             b.get("genre"),
+                "price":             b.get("price", "free"),
+                "url":               b.get("url"),
+                "downloads":         b.get("downloads", 0),
+                "playCount":         b.get("playCount", 0),
+                "producer":          user.get("name", user.get("username", "Unknown")),
+                "producer_username": user.get("username", ""),
             }
             for b in beats
         ],
@@ -304,14 +277,6 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Subscription status (called after Stripe redirect + on app load) ─
 @router.get("/subscription-status")
 async def subscription_status(request: Request, user=Depends(get_current_user)):
-    # CEO account is always active Producer Pro — never auto-downgrade
-    if user.get("username") == "Trelli":
-        return {
-            "plan":                  "producer",
-            "subscriptionActive":    True,
-            "subscriptionExpiresAt": None,
-            "billingInterval":       "lifetime",
-        }
     db         = request.app.state.db
     expires_at = user.get("subscription_expires_at")
     plan       = user.get("plan", "free")
@@ -403,13 +368,15 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "isFollowing":           is_following,
         "beats": [
             {
-                "id":        str(b["_id"]),
-                "title":     b.get("title"),
-                "genre":     b.get("genre"),
-                "price":     b.get("price", "free"),
-                "url":       b.get("url"),
-                "downloads": b.get("downloads", 0),
-                "playCount": b.get("playCount", 0),
+                "id":                str(b["_id"]),
+                "title":             b.get("title"),
+                "genre":             b.get("genre"),
+                "price":             b.get("price", "free"),
+                "url":               b.get("url"),
+                "downloads":         b.get("downloads", 0),
+                "playCount":         b.get("playCount", 0),
+                "producer":          user.get("name", user.get("username", "Unknown")),
+                "producer_username": user.get("username", ""),
             }
             for b in beats
         ],
@@ -454,62 +421,6 @@ async def unfollow_user(username: str, request: Request, user=Depends(get_curren
         "following_id": str(target["_id"]),
     })
     return {"success": True, "following": False}
-
-
-# ── Followers list ───────────────────────────────────────────────
-@router.get("/followers/{username}")
-async def get_followers(username: str, request: Request):
-    db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
-    target_id = str(target["_id"])
-    # Get all follow docs where this user is being followed
-    follow_docs = await db.follows.find({"following_id": target_id}).to_list(500)
-    follower_ids = [f["follower_id"] for f in follow_docs]
-    if not follower_ids:
-        return []
-    users = await db.users.find(
-        {"_id": {"$in": follower_ids}},
-        {"password": 0}
-    ).to_list(500)
-    return [
-        {
-            "username": u.get("username", ""),
-            "name":     u.get("name", ""),
-            "avatarUrl": u.get("avatarUrl", ""),
-            "plan":     u.get("plan", "free"),
-        }
-        for u in users
-    ]
-
-
-# ── Following list ───────────────────────────────────────────────
-@router.get("/following/{username}")
-async def get_following(username: str, request: Request):
-    db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
-    target_id = str(target["_id"])
-    # Get all follow docs where this user is the follower
-    follow_docs = await db.follows.find({"follower_id": target_id}).to_list(500)
-    following_ids = [f["following_id"] for f in follow_docs]
-    if not following_ids:
-        return []
-    users = await db.users.find(
-        {"_id": {"$in": following_ids}},
-        {"password": 0}
-    ).to_list(500)
-    return [
-        {
-            "username": u.get("username", ""),
-            "name":     u.get("name", ""),
-            "avatarUrl": u.get("avatarUrl", ""),
-            "plan":     u.get("plan", "free"),
-        }
-        for u in users
-    ]
 
 
 # ── Change password ───────────────────────────────────────────────
