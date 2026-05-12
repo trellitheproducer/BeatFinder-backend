@@ -455,6 +455,55 @@ async def track_download(beat_id: str, request: Request):
     return {"success": True}
 
 
+# ── Proxy download — streams file with Content-Disposition: attachment ─────────
+# This forces iOS Safari to show "Save to Files" instead of opening a media player.
+
+from fastapi.responses import StreamingResponse
+import re as _re
+
+@router.get("/beats/{beat_id}/file")
+async def proxy_download(beat_id: str, request: Request):
+    from bson import ObjectId
+    db   = request.app.state.db
+    try:
+        beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid beat ID")
+    if not beat:
+        raise HTTPException(status_code=404, detail="Beat not found")
+
+    url = beat.get("url", "")
+    if not url:
+        raise HTTPException(status_code=404, detail="No file for this beat")
+
+    # Safe filename
+    raw_title = beat.get("title", "beat")
+    safe_title = _re.sub(r'[^\w\s\-]', '', raw_title).strip().replace(" ", "_") or "beat"
+    filename   = safe_title + ".mp3"
+
+    # Increment download count
+    await db.producer_beats.update_one(
+        {"_id": ObjectId(beat_id)},
+        {"$inc": {"downloads": 1}}
+    )
+
+    # Stream file from Cloudinary with attachment header
+    async def generate():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("GET", url) as resp:
+                async for chunk in resp.aiter_bytes(65536):
+                    yield chunk
+
+    return StreamingResponse(
+        generate(),
+        media_type="audio/mpeg",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control":       "no-cache",
+        },
+    )
+
+
 # ── Delete a beat ──────────────────────────────────────────────────────────────
 
 @router.delete("/beats/{beat_id}")
