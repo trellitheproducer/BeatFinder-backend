@@ -419,6 +419,62 @@ async def unfollow_user(username: str, request: Request, user=Depends(get_curren
     return {"success": True, "following": False}
 
 
+# ── Followers list ───────────────────────────────────────────────
+@router.get("/followers/{username}")
+async def get_followers(username: str, request: Request):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target_id = str(target["_id"])
+    # Get all follow docs where this user is being followed
+    follow_docs = await db.follows.find({"following_id": target_id}).to_list(500)
+    follower_ids = [f["follower_id"] for f in follow_docs]
+    if not follower_ids:
+        return []
+    users = await db.users.find(
+        {"_id": {"$in": follower_ids}},
+        {"password": 0}
+    ).to_list(500)
+    return [
+        {
+            "username": u.get("username", ""),
+            "name":     u.get("name", ""),
+            "avatarUrl": u.get("avatarUrl", ""),
+            "plan":     u.get("plan", "free"),
+        }
+        for u in users
+    ]
+
+
+# ── Following list ───────────────────────────────────────────────
+@router.get("/following/{username}")
+async def get_following(username: str, request: Request):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target_id = str(target["_id"])
+    # Get all follow docs where this user is the follower
+    follow_docs = await db.follows.find({"follower_id": target_id}).to_list(500)
+    following_ids = [f["following_id"] for f in follow_docs]
+    if not following_ids:
+        return []
+    users = await db.users.find(
+        {"_id": {"$in": following_ids}},
+        {"password": 0}
+    ).to_list(500)
+    return [
+        {
+            "username": u.get("username", ""),
+            "name":     u.get("name", ""),
+            "avatarUrl": u.get("avatarUrl", ""),
+            "plan":     u.get("plan", "free"),
+        }
+        for u in users
+    ]
+
+
 # ── Change password ───────────────────────────────────────────────
 class ChangePasswordRequest(BaseModel):
     current_password: str
