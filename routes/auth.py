@@ -294,6 +294,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
                 "playCount":         b.get("playCount", 0),
                 "producer":          user.get("name", user.get("username", "Unknown")),
                 "producer_username": user.get("username", ""),
+                "producer_avatar":   user.get("avatarUrl", ""),
             }
             for b in beats
         ],
@@ -411,6 +412,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
                 "playCount":         b.get("playCount", 0),
                 "producer":          user.get("name", user.get("username", "Unknown")),
                 "producer_username": user.get("username", ""),
+                "producer_avatar":   user.get("avatarUrl", ""),
             }
             for b in beats
         ],
