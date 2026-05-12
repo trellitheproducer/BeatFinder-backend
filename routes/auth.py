@@ -21,14 +21,21 @@ PLANS = {
 
 def _public(user: dict) -> dict:
     from datetime import timezone
-    # ── Trelli (CEO/owner) always has Producer Pro, never expires ──
-    if user.get("username") == "Trelli":
+
+    # ── Lifetime accounts — never expire ──────────────────────────────
+    LIFETIME_ACCOUNTS = {
+        "Trelli":  {"plan": "producer", "is_admin": True},
+        "Mikez":   {"plan": "artist",   "is_admin": False},
+    }
+    username = user.get("username", "")
+    if username in LIFETIME_ACCOUNTS:
+        cfg = LIFETIME_ACCOUNTS[username]
         return {
             "id":                    str(user["_id"]),
             "name":                  user.get("name", ""),
             "email":                 user.get("email", ""),
-            "plan":                  "producer",
-            "username":              user.get("username", ""),
+            "plan":                  cfg["plan"],
+            "username":              username,
             "bio":                   user.get("bio", ""),
             "location":              user.get("location", ""),
             "instagram":             user.get("instagram", ""),
@@ -40,7 +47,7 @@ def _public(user: dict) -> dict:
             "avatarUrl":             user.get("avatarUrl", ""),
             "appleMusic":            user.get("appleMusic", ""),
             "headerUrl":             user.get("headerUrl", ""),
-            "is_admin":              True,
+            "is_admin":              cfg["is_admin"],
             "created_at":            user.get("created_at", "").isoformat() if user.get("created_at") else None,
             "subscriptionActive":    True,
             "subscriptionExpiresAt": None,
@@ -304,10 +311,14 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Subscription status (called after Stripe redirect + on app load) ─
 @router.get("/subscription-status")
 async def subscription_status(request: Request, user=Depends(get_current_user)):
-    # CEO account is always active Producer Pro — never auto-downgrade
-    if user.get("username") == "Trelli":
+    # Lifetime accounts — never auto-downgrade
+    LIFETIME = {
+        "Trelli": "producer",
+        "Mikez":  "artist",
+    }
+    if user.get("username") in LIFETIME:
         return {
-            "plan":                  "producer",
+            "plan":                  LIFETIME[user.get("username")],
             "subscriptionActive":    True,
             "subscriptionExpiresAt": None,
             "billingInterval":       "lifetime",
