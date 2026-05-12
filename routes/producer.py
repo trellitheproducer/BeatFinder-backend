@@ -480,13 +480,25 @@ async def track_download(beat_id: str, request: Request):
 
 
 # ── Proxy download — forces iOS Safari native download dialog ─────────────────
-# iOS Safari only shows its "Save to Files" / download dialog when:
-#   1. The server responds with Content-Disposition: attachment
-#   2. The browser navigates directly to the URL (window.location.href)
-# Blob/fetch + programmatic click does NOT work on iOS Safari.
+# iOS Safari shows "Do you want to download?" when:
+#   - A user-gesture triggered anchor click hits a URL
+#   - The server responds with Content-Disposition: attachment
+# CORS headers allow cross-origin requests from Vercel frontend.
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 import re as _re
+
+@router.options("/beats/{beat_id}/file")
+async def proxy_download_options(beat_id: str):
+    """Handle CORS preflight for the download route."""
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        }
+    )
 
 @router.get("/beats/{beat_id}/file")
 async def proxy_download(beat_id: str, request: Request):
