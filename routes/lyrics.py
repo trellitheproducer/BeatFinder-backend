@@ -123,7 +123,13 @@ async def bulk_import(
     imported = 0
 
     for lyric in body.lyrics:
-        lyric_id = lyric.id or str(ObjectId())
+        # ── FIX: skip lyrics with no valid id — prevents DuplicateKeyError
+        # on the user_id_1_lyric_id_1 index where lyric_id would be null
+        if not lyric.id or not lyric.id.strip():
+            continue
+
+        lyric_id = lyric.id
+
         # Upsert — skip if already exists with same id
         result = await db.lyrics.update_one(
             {"_id": lyric_id, "user_id": user_id},
