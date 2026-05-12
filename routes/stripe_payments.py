@@ -116,19 +116,39 @@ async def create_checkout(
     user=Depends(get_current_user),
 ):
     body    = await request.json()
-    plan    = body.get("plan")
-    billing = body.get("billing", "monthly")  # "monthly" | "annual"  ← new
 
-    if plan not in ("artist", "producer"):
-        raise HTTPException(status_code=400, detail="Invalid plan")
-    if billing not in ("monthly", "annual"):
-        raise HTTPException(status_code=400, detail="Invalid billing interval")
+    # Accept price_id directly (preferred — sent by PlanPicker component)
+    price_id = body.get("price_id")
+    plan     = body.get("plan")
+    billing  = body.get("billing", "monthly")
 
-    # Pick the right Stripe price ID based on plan + billing interval
-    if plan == "artist":
-        price_id = ARTIST_ANNUAL_PRICE_ID if billing == "annual" else ARTIST_PRICE_ID
-    else:
-        price_id = PRODUCER_ANNUAL_PRICE_ID if billing == "annual" else PRODUCER_PRICE_ID
+    # Map yearly placeholder IDs to real env-var IDs if needed
+    YEARLY_MAP = {
+        "price_artist_yearly_REPLACE":   ARTIST_ANNUAL_PRICE_ID,
+        "price_producer_yearly_REPLACE": PRODUCER_ANNUAL_PRICE_ID,
+    }
+    if price_id and price_id in YEARLY_MAP:
+        price_id = YEARLY_MAP[price_id]
+
+    if not price_id:
+        # Fall back to plan + billing lookup
+        if plan not in ("artist", "producer"):
+            raise HTTPException(status_code=400, detail="Invalid plan")
+        if billing not in ("monthly", "annual", "yearly"):
+            raise HTTPException(status_code=400, detail="Invalid billing interval")
+        if plan == "artist":
+            price_id = ARTIST_ANNUAL_PRICE_ID if billing in ("annual", "yearly") else ARTIST_PRICE_ID
+        else:
+            price_id = PRODUCER_ANNUAL_PRICE_ID if billing in ("annual", "yearly") else PRODUCER_PRICE_ID
+
+    # Derive plan label for metadata if not provided
+    if not plan:
+        if price_id in (ARTIST_PRICE_ID, ARTIST_ANNUAL_PRICE_ID):
+            plan = "artist"
+        elif price_id in (PRODUCER_PRICE_ID, PRODUCER_ANNUAL_PRICE_ID):
+            plan = "producer"
+        else:
+            plan = "unknown"
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(
@@ -145,7 +165,7 @@ async def create_checkout(
                 "metadata[user_email]":        user["email"],
                 "metadata[user_name]":         user.get("name", ""),
                 "metadata[plan]":              plan,
-                "metadata[billing]":           billing,   # ← new
+                "metadata[billing]":           billing,
                 "payment_method_types[0]":     "card",
                 "custom_text[submit][message]":"Subscribe to BeatFinder",
             },
