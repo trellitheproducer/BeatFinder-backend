@@ -106,6 +106,24 @@ async def upload_beat(
 async def list_producer_beats(request: Request):
     db   = request.app.state.db
     docs = await db.producer_beats.find({}).sort("uploaded_at", -1).to_list(100)
+
+    # Batch-fetch producer avatars
+    producer_ids = list({d.get("producer_id") for d in docs if d.get("producer_id")})
+    avatar_map = {}
+    username_map = {}
+    if producer_ids:
+        from bson import ObjectId as _ObjId
+        valid_ids = []
+        for pid in producer_ids:
+            try: valid_ids.append(_ObjId(pid))
+            except Exception: pass
+        if valid_ids:
+            users = await db.users.find({"_id": {"$in": valid_ids}}, {"avatarUrl": 1, "username": 1}).to_list(100)
+            for u in users:
+                uid = str(u["_id"])
+                avatar_map[uid]   = u.get("avatarUrl", "")
+                username_map[uid] = u.get("username", "")
+
     return [
         {
             "id":                str(d["_id"]),
@@ -115,6 +133,8 @@ async def list_producer_beats(request: Request):
             "url":               d.get("url"),
             "producer":          d.get("producer"),
             "producer_id":       d.get("producer_id"),
+            "producer_username": username_map.get(d.get("producer_id", ""), ""),
+            "producer_avatar":   avatar_map.get(d.get("producer_id", ""), ""),
             "stripe_account_id": d.get("stripe_account_id"),
             "downloads":         d.get("downloads", 0),
             "uploaded_at":       d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
