@@ -775,3 +775,81 @@ async def activate_plan(body: ActivateRequest, request: Request, user=Depends(ge
         {"$set": {"plan": plan, "upgraded_at": datetime.utcnow()}}
     )
     return {"success": True, "plan": plan, "message": plan + " plan activated successfully!"}
+
+
+# ── Beat play tracking ────────────────────────────────────────────────────────
+# Rules:
+#   - Only counts when audio actually plays (called from onPlay after 3s)
+#   - Anti-spam: one count per (beat_id + ip_hash) per 30 minutes
+#   - Atomically increments beat.playCount and owner.totalPlayCount
+#   - Records a BeatPlay document for analytics
+
+import hashlib as _hashlib
+
+@router.post("/beat-play/{beat_id}")
+async def record_beat_play(beat_id: str, request: Request):
+    db = request.app.state.db
+
+    # Validate beat exists
+    try:
+        beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid beat ID")
+    if not beat:
+        raise HTTPException(status_code=404, detail="Beat not found")
+
+    # Hash the IP — never store raw IP
+    raw_ip  = request.client.host if request.client else "unknown"
+    ip_hash = _hashlib.sha256(raw_ip.encode()).hexdigest()[:16]
+
+    # Check 30-min cooldown per ip+beat
+    from datetime import timedelta
+    cutoff   = datetime.utcnow() - timedelta(seconds=1800)
+    existing = await db.beat_plays.find_one({
+        "beat_id":   beat_id,
+        "ip_hash":   ip_hash,
+        "played_at": {"$gte": cutoff},
+    })
+    if existing:
+        return {"counted": False, "playCount": beat.get("playCount", 0), "reason": "cooldown"}
+
+    # Atomic increment on beat
+    result = await db.producer_beats.find_one_and_update(
+        {"_id": ObjectId(beat_id)},
+        {"$inc": {"playCount": 1}},
+        return_document=True,
+    )
+    new_count = result.get("playCount", 1) if result else 1
+
+    # Atomic increment on owner totalPlayCount
+    producer_id = beat.get("producer_id")
+    if producer_id:
+        try:
+            await db.users.update_one(
+                {"_id": ObjectId(producer_id)},
+                {"$inc": {"totalPlayCount": 1}},
+            )
+        except Exception:
+            pass
+
+    # Analytics record
+    await db.beat_plays.insert_one({
+        "beat_id":    beat_id,
+        "ip_hash":    ip_hash,
+        "producer_id": producer_id or "",
+        "played_at":  datetime.utcnow(),
+    })
+
+    return {"counted": True, "playCount": new_count}
+
+
+@router.get("/beat-play/{beat_id}")
+async def get_beat_play_count(beat_id: str, request: Request):
+    db = request.app.state.db
+    try:
+        beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)}, {"playCount": 1})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid beat ID")
+    if not beat:
+        raise HTTPException(status_code=404, detail="Beat not found")
+    return {"playCount": beat.get("playCount", 0)}
