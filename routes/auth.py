@@ -21,6 +21,33 @@ PLANS = {
 
 def _public(user: dict) -> dict:
     from datetime import timezone
+    # ── Trelli (CEO/owner) always has Producer Pro, never expires ──
+    CEO_USERNAME = "Trelli"
+    if user.get("username") == CEO_USERNAME:
+        return {
+            "id":                    str(user["_id"]),
+            "name":                  user.get("name", ""),
+            "email":                 user.get("email", ""),
+            "plan":                  "producer",
+            "username":              user.get("username", ""),
+            "bio":                   user.get("bio", ""),
+            "location":              user.get("location", ""),
+            "instagram":             user.get("instagram", ""),
+            "tiktok":                user.get("tiktok", ""),
+            "youtube":               user.get("youtube", ""),
+            "spotify":               user.get("spotify", ""),
+            "website":               user.get("website", ""),
+            "avatarColor":           user.get("avatarColor", ""),
+            "avatarUrl":             user.get("avatarUrl", ""),
+            "appleMusic":            user.get("appleMusic", ""),
+            "headerUrl":             user.get("headerUrl", ""),
+            "is_admin":              True,
+            "created_at":            user.get("created_at", "").isoformat() if user.get("created_at") else None,
+            "subscriptionActive":    True,
+            "subscriptionExpiresAt": None,
+            "billingInterval":       "lifetime",
+        }
+
     expires_at = user.get("subscription_expires_at")
     # Active if expires_at is in the future (or not set for legacy free accounts)
     sub_active = False
@@ -36,11 +63,13 @@ def _public(user: dict) -> dict:
     # Free plan users are never "active" via subscription
     if plan == "free":
         sub_active = False
+    # Expired paid plan — treat as free for feature gating
+    effective_plan = plan if sub_active else "free"
     return {
         "id":                    str(user["_id"]),
         "name":                  user.get("name", ""),
         "email":                 user.get("email", ""),
-        "plan":                  plan,
+        "plan":                  effective_plan,
         "username":              user.get("username", ""),
         "bio":                   user.get("bio", ""),
         "location":              user.get("location", ""),
@@ -275,6 +304,14 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Subscription status (called after Stripe redirect + on app load) ─
 @router.get("/subscription-status")
 async def subscription_status(request: Request, user=Depends(get_current_user)):
+    # CEO account is always active Producer Pro — never auto-downgrade
+    if user.get("username") == "Trelli":
+        return {
+            "plan":                  "producer",
+            "subscriptionActive":    True,
+            "subscriptionExpiresAt": None,
+            "billingInterval":       "lifetime",
+        }
     db         = request.app.state.db
     expires_at = user.get("subscription_expires_at")
     plan       = user.get("plan", "free")
