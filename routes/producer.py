@@ -566,13 +566,12 @@ async def delete_beat(beat_id: str, request: Request, user=Depends(get_current_u
 
 
 # ── One-time backfill: sync producer_avatar onto all existing beats ────────────
-# Call GET /api/producer/backfill-avatars once after deploy to fix existing beats
-# that were uploaded before producer_avatar was stored on the beat document.
+# Call GET /api/producer/backfill-avatars?key=beatfinder_admin once after deploy
 
 @router.get("/backfill-avatars")
-async def backfill_avatars(request: Request, user=Depends(get_current_user)):
-    if user.get("username") != "Trelli":
-        raise HTTPException(status_code=403, detail="Admin only")
+async def backfill_avatars(request: Request, key: str = ""):
+    if key != "beatfinder_admin":
+        raise HTTPException(status_code=403, detail="Invalid key")
     db   = request.app.state.db
     docs = await db.producer_beats.find({}).to_list(1000)
     updated = 0
