@@ -660,6 +660,12 @@ async def upload_avatar(
         {"$set": {"avatarUrl": avatar_url}}
     )
 
+    # Sync producer_avatar on all beats by this user so cards show latest photo
+    await db.producer_beats.update_many(
+        {"producer_id": str(user["_id"])},
+        {"$set": {"producer_avatar": avatar_url}}
+    )
+
     return {"avatarUrl": avatar_url}
 
 
