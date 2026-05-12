@@ -887,28 +887,37 @@ async def get_beat_play_count(beat_id: str, request: Request):
 # Tracks are songs artists have recorded, can tag producer @mentions
 # =============================================================================
 
-import cloudinary.uploader as _cld_up
 import os as _os
+import hashlib as _hashlib
+import hmac as _hmac
+import time as _time
 
-_CLOUD_NAME = _os.getenv("CLOUDINARY_CLOUD_NAME","")
-_API_KEY_CLD = _os.getenv("CLOUDINARY_API_KEY","")
-_API_SECRET  = _os.getenv("CLOUDINARY_API_SECRET","")
+_CLOUD_NAME  = _os.getenv("CLOUDINARY_CLOUD_NAME", "")
+_API_KEY_CLD = _os.getenv("CLOUDINARY_API_KEY", "")
+_API_SECRET  = _os.getenv("CLOUDINARY_API_SECRET", "")
 
 async def _upload_track_to_cloudinary(data: bytes, filename: str) -> str:
-    import cloudinary
-    cloudinary.config(cloud_name=_CLOUD_NAME, api_key=_API_KEY_CLD, api_secret=_API_SECRET)
-    import asyncio, functools
-    result = await asyncio.get_event_loop().run_in_executor(
-        None,
-        functools.partial(
-            cloudinary.uploader.upload,
-            data,
-            resource_type="video",  # Cloudinary uses "video" for audio too
-            public_id="tracks/" + filename.replace(" ","_"),
-            overwrite=False,
-        )
-    )
-    return result.get("secure_url","")
+    """Upload audio to Cloudinary using signed HTTP POST — no SDK needed."""
+    import httpx
+    public_id  = "tracks/" + filename.replace(" ", "_").rsplit(".", 1)[0]
+    timestamp  = str(int(_time.time()))
+    params     = f"public_id={public_id}&resource_type=video&timestamp={timestamp}"
+    signature  = _hashlib.sha1(
+        (params + _API_SECRET).encode()
+    ).hexdigest()
+
+    upload_url = f"https://api.cloudinary.com/v1_1/{_CLOUD_NAME}/video/upload"
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(upload_url, data={
+            "api_key":      _API_KEY_CLD,
+            "timestamp":    timestamp,
+            "public_id":    public_id,
+            "signature":    signature,
+            "resource_type":"video",
+        }, files={"file": (filename, data, "audio/mpeg")})
+        if resp.status_code != 200:
+            raise Exception(f"Cloudinary upload failed: {resp.text}")
+        return resp.json().get("secure_url", "")
 
 
 @router.post("/tracks/upload")
