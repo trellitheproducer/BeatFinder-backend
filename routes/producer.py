@@ -382,6 +382,11 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     if tier == "premium" and beat.get("premium_sold"):
         raise HTTPException(status_code=409, detail="The premium (exclusive) lease for this beat has already been sold")
 
+    # Block basic purchases once premium has been sold — beat is fully retired.
+    # Existing basic licences sold before the premium are voided automatically.
+    if tier == "basic" and beat.get("premium_sold"):
+        raise HTTPException(status_code=409, detail="This beat is no longer available — the exclusive (premium) lease has been sold")
+
     # Determine the correct price for the selected tier.
     # For legacy beats without explicit tier prices, fall back to the beat's
     # primary price for the basic tier and reject premium purchases.
@@ -558,6 +563,26 @@ async def lease_webhook(request: Request):
             update_ops
         )
 
+        # When premium is purchased, all previously-sold BASIC leases for this
+        # beat become void. The basic buyers agreed at purchase time that the
+        # licence is revocable on exclusive sale (clause 6 of the basic
+        # contract) and acknowledged no refund.
+        if tier == "premium":
+            void_result = await db.purchased_leases.update_many(
+                {
+                    "beat_id": beat_id,
+                    "tier":    "basic",
+                    "voided":  {"$ne": True},
+                },
+                {"$set": {
+                    "voided":        True,
+                    "voided_at":     datetime.utcnow(),
+                    "voided_reason": "premium_sold",
+                }},
+            )
+            if void_result.modified_count > 0:
+                print(f"[Lease] Premium sale voided {void_result.modified_count} prior basic lease(s) for beat {beat_id}")
+
         print(f"[Lease] Beat {beat_id} purchased ({tier}) by {buyer_email}")
 
     return {"received": True}
@@ -604,6 +629,9 @@ async def my_leases(request: Request, user=Depends(get_current_user)):
             "buyer_email":       buyer_email,
             "price":             d.get("price", ""),
             "tier":              d.get("tier", "basic"),
+            "voided":            bool(d.get("voided", False)),
+            "voided_reason":     d.get("voided_reason", ""),
+            "voided_at":         d.get("voided_at", "").isoformat() if d.get("voided_at") and hasattr(d.get("voided_at"), "isoformat") else (d.get("voided_at") or ""),
             "purchased_at":      d.get("purchased_at", "").isoformat() if d.get("purchased_at") else "",
         })
     return result
