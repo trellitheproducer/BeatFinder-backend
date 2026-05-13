@@ -10,3 +10,4 @@ python-dotenv
 pydantic[email]
 email-validator
 python-multipart
+reportlab>=4.0.0
