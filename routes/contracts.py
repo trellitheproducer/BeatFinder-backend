@@ -301,84 +301,170 @@ def build_lease_pdf(*,
     beat_title: str, producer: str,
     licensee_name: str, licensee_email: str,
     price: str, reference: str, date_str: str,
+    tier: str = "basic",
 ) -> bytes:
+    """Build a tier-specific lease PDF.
+
+    Two tiers:
+      • BASIC   — £50 fixed, non-exclusive, 75% comp royalties to producer,
+                  buyer may resell the New Work but never the Beat itself.
+      • PREMIUM — £100-£500, EXCLUSIVE, 50% comp royalties to producer,
+                  Beat is retired after purchase. No resale of New Work or Beat.
+    """
+    tier = (tier or "basic").strip().lower()
+    if tier not in ("basic", "premium"):
+        tier = "basic"
+    is_premium = (tier == "premium")
+
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=20 * mm, rightMargin=20 * mm,
         topMargin=32 * mm, bottomMargin=20 * mm,
-        title=f"BeatFinder Lease — {beat_title}",
+        title=f"BeatFinder {'Premium ' if is_premium else ''}Lease — {beat_title}",
         author="BeatFinder",
     )
     S = _styles()
     story = []
 
-    story.append(Paragraph("NON-EXCLUSIVE BEAT LEASE AGREEMENT", S["title"]))
+    if is_premium:
+        story.append(Paragraph("EXCLUSIVE PREMIUM BEAT LEASE AGREEMENT", S["title"]))
+    else:
+        story.append(Paragraph("NON-EXCLUSIVE BASIC BEAT LEASE AGREEMENT", S["title"]))
     story.append(Paragraph(f"Reference: {reference} &nbsp;|&nbsp; Date: {date_str}", S["subtitle"]))
 
     story.append(_info_table([
         ["Beat",      f'"{beat_title}"'],
         ["Producer",  producer],
         ["Licensee",  f"{licensee_name} ({licensee_email})"],
-        ["Licence",   "MP3 Non-Exclusive Lease"],
+        ["Licence",   "Premium Exclusive Lease" if is_premium else "Basic Non-Exclusive Lease"],
         ["Fee",       price or "£0.00"],
         ["Payment",   "Confirmed via Stripe"],
     ]))
     story.append(Spacer(1, 14))
 
-    sections = [
-        ("1. GRANT OF LICENCE",
-         "Subject to receipt of the Fee, the Producer grants the Licensee a "
-         "non-exclusive, non-transferable, worldwide licence to use the Beat "
-         "in the creation, recording, performance and commercial distribution "
-         "of one (1) new musical composition (the \"New Work\")."),
-        ("2. PERMITTED USES",
-         "The Licensee may (a) commercially distribute the New Work on all "
-         "monetised streaming and download platforms (including Spotify, "
-         "Apple Music, YouTube monetised, TikTok and similar); (b) perform "
-         "the New Work at paid and unpaid live events; (c) make up to "
-         "100,000 cumulative paid downloads and/or streams across all "
-         f'platforms; (d) use the New Work in non-broadcast video content. '
-         f'The Licensee must include the credit "(Prod. by {producer})" in '
-         "the metadata, description or liner notes of every release."),
-        ("3. RESTRICTIONS",
-         "The Licensee shall NOT: (a) sell, lease, sub-licence or otherwise "
-         "transfer the Beat itself, in whole or in part, to any third party; "
-         "(b) claim authorship of or copyright in the Beat; (c) register the "
-         "Beat as their own composition with any rights organisation; "
-         "(d) use the Beat in any broadcast advertisement, film or "
-         "television sync without a separate written agreement; (e) exceed "
-         "the 100,000 stream/download threshold without upgrading to an "
-         "exclusive licence."),
-        ("4. OWNERSHIP",
-         "The Producer retains full copyright and master ownership of the "
-         "Beat. The Licensee owns the New Work as a derivative composition. "
-         "Composition royalties shall be split 50% to the Producer and 50% "
-         "to the Licensee. Master recording royalties belong 100% to the Licensee."),
-        ("5. CREDIT REQUIREMENT",
-         f'All public uses of the New Work must include the credit '
-         f'"Produced by {producer}" or "(Prod. by {producer})" in a visible '
-         "location appropriate to the medium (track metadata, video "
-         "description, liner notes or on-screen credits)."),
-        ("6. WARRANTIES",
-         "The Producer warrants that the Beat is their original work, free "
-         "from third-party claims, and that they have full authority to "
-         "grant this Licence. The Licensee warrants that any vocals, lyrics "
-         "or additional production they add are their original work."),
-        ("7. PLATFORM",
-         "BeatFinder (beatfinder.co.uk) facilitates this Agreement and the "
-         "associated payment as a platform provider only and is not a party "
-         "to this Agreement. BeatFinder accepts no liability for any dispute "
-         "between the Producer and Licensee."),
-        ("8. TERM AND TERMINATION",
-         "This Licence is perpetual unless terminated for breach. Upon "
-         "termination for breach, the Licensee must cease all distribution "
-         "of the New Work; any prior good-faith distribution remains licensed."),
-        ("9. GOVERNING LAW",
-         "This Agreement shall be governed by and construed in accordance "
-         "with the laws of England and Wales, and the parties submit to the "
-         "exclusive jurisdiction of the English courts."),
-    ]
+    if is_premium:
+        sections = [
+            ("1. GRANT OF EXCLUSIVE LICENCE",
+             "Subject to receipt of the Fee, the Producer grants the Licensee an "
+             "EXCLUSIVE, non-transferable, worldwide licence to use the Beat in "
+             "the creation, recording, performance and commercial distribution "
+             "of musical compositions (the \"New Works\"). On execution of this "
+             "Agreement the Beat is withdrawn from sale on BeatFinder and the "
+             "Producer shall not licence the Beat to any other party."),
+            ("2. PERMITTED USES — UNLIMITED",
+             "The Licensee may (a) commercially distribute the New Works on all "
+             "monetised streaming and download platforms (Spotify, Apple Music, "
+             "YouTube monetised, TikTok, Amazon, Tidal and similar); (b) perform "
+             "the New Works at paid and unpaid live events without limit; "
+             "(c) use the New Works in broadcast advertisements, film, "
+             "television and video game sync; (d) make UNLIMITED downloads, "
+             "streams and physical sales. There is no streaming or revenue cap."),
+            ("3. RESTRICTIONS",
+             "The Licensee shall NOT: (a) sell, lease, sub-licence or otherwise "
+             "transfer the Beat itself (as a beat) to any third party; (b) claim "
+             "authorship of or copyright in the Beat as a standalone work apart "
+             "from the New Works; (c) register the Beat as their own composition "
+             "with any rights organisation; (d) resell the Beat as an instrumental "
+             "or type-beat. Resale of the New Works as completed records is permitted."),
+            ("4. OWNERSHIP & ROYALTIES",
+             "The Producer retains copyright and master ownership of the Beat as "
+             "a beat; the Licensee owns the New Works as derivative compositions. "
+             "Composition (publishing) royalties shall be split <b>50% to the "
+             "Producer and 50% to the Licensee</b>. Master recording royalties "
+             "belong 100% to the Licensee. Producer must be registered as a "
+             "co-writer on all New Works via the Licensee's PRO."),
+            ("5. CREDIT REQUIREMENT",
+             f'All public uses of any New Work must include the credit '
+             f'"Produced by {producer}" or "(Prod. by {producer})" in a visible '
+             "location appropriate to the medium (track metadata, video "
+             "description, liner notes or on-screen credits)."),
+            ("6. EXCLUSIVITY GUARANTEE",
+             "The Producer warrants that, from the date of this Agreement, the "
+             "Beat shall not be sold, licensed, leased or otherwise distributed "
+             "to any party other than the Licensee. The Producer shall remove "
+             "the Beat from public listings on BeatFinder. Existing basic-tier "
+             "licences (if any) sold prior to this Agreement remain valid as "
+             "non-exclusive uses only and do not affect the Licensee's "
+             "exclusivity for new purchases."),
+            ("7. WARRANTIES",
+             "The Producer warrants the Beat is their original work, free from "
+             "third-party claims, and that they have full authority to grant "
+             "this exclusive Licence. The Licensee warrants any vocals, lyrics "
+             "or additional production they add are their original work."),
+            ("8. PLATFORM",
+             "BeatFinder (beatfinder.co.uk) facilitates this Agreement and "
+             "associated payment as a platform provider only and is not a party "
+             "to this Agreement. BeatFinder accepts no liability for any "
+             "dispute between Producer and Licensee."),
+            ("9. TERM AND TERMINATION",
+             "This Licence is perpetual unless terminated for breach. Upon "
+             "termination for breach by the Producer, the Licensee is entitled "
+             "to a full refund. Upon termination for breach by the Licensee, "
+             "the exclusive grant is revoked and the Producer may re-list the "
+             "Beat for future sale."),
+            ("10. GOVERNING LAW",
+             "This Agreement shall be governed by and construed in accordance "
+             "with the laws of England and Wales, and the parties submit to "
+             "the exclusive jurisdiction of the English courts."),
+        ]
+    else:
+        sections = [
+            ("1. GRANT OF LICENCE",
+             "Subject to receipt of the Fee, the Producer grants the Licensee a "
+             "non-exclusive, non-transferable, worldwide licence to use the Beat "
+             "in the creation, recording, performance and commercial distribution "
+             "of one (1) new musical composition (the \"New Work\")."),
+            ("2. PERMITTED USES",
+             "The Licensee may (a) commercially distribute the New Work on all "
+             "monetised streaming and download platforms (including Spotify, "
+             "Apple Music, YouTube monetised, TikTok and similar); (b) perform "
+             "the New Work at paid and unpaid live events; (c) make up to "
+             "100,000 cumulative paid downloads and/or streams across all "
+             f'platforms; (d) use the New Work in non-broadcast video content. '
+             f'The Licensee must include the credit "(Prod. by {producer})" in '
+             "the metadata, description or liner notes of every release."),
+            ("3. RESTRICTIONS",
+             "The Licensee shall NOT: (a) sell, lease, sub-licence or otherwise "
+             "transfer the Beat itself, in whole or in part, to any third party; "
+             "(b) claim authorship of or copyright in the Beat; (c) register the "
+             "Beat as their own composition with any rights organisation; "
+             "(d) use the Beat in any broadcast advertisement, film or "
+             "television sync without a separate written agreement; (e) exceed "
+             "the 100,000 stream/download threshold without upgrading to a "
+             "premium or exclusive licence. Resale of the completed New Work as "
+             "a finished record is permitted; resale of the Beat itself is not."),
+            ("4. OWNERSHIP & ROYALTIES",
+             "The Producer retains full copyright and master ownership of the "
+             "Beat. The Licensee owns the New Work as a derivative composition. "
+             "Composition (publishing) royalties shall be split <b>75% to the "
+             "Producer and 25% to the Licensee</b>. Master recording royalties "
+             "belong 100% to the Licensee."),
+            ("5. CREDIT REQUIREMENT",
+             f'All public uses of the New Work must include the credit '
+             f'"Produced by {producer}" or "(Prod. by {producer})" in a visible '
+             "location appropriate to the medium (track metadata, video "
+             "description, liner notes or on-screen credits)."),
+            ("6. WARRANTIES",
+             "The Producer warrants that the Beat is their original work, free "
+             "from third-party claims, and that they have full authority to "
+             "grant this Licence. The Licensee warrants that any vocals, lyrics "
+             "or additional production they add are their original work."),
+            ("7. PLATFORM",
+             "BeatFinder (beatfinder.co.uk) facilitates this Agreement and the "
+             "associated payment as a platform provider only and is not a party "
+             "to this Agreement. BeatFinder accepts no liability for any dispute "
+             "between the Producer and Licensee."),
+            ("8. TERM AND TERMINATION",
+             "This Licence is perpetual unless terminated for breach. Upon "
+             "termination for breach, the Licensee must cease all distribution "
+             "of the New Work; any prior good-faith distribution remains licensed."),
+            ("9. GOVERNING LAW",
+             "This Agreement shall be governed by and construed in accordance "
+             "with the laws of England and Wales, and the parties submit to the "
+             "exclusive jurisdiction of the English courts."),
+        ]
+
     for heading, body in sections:
         story.append(Paragraph(heading, S["h2"]))
         story.append(Paragraph(body, S["body"]))
@@ -392,7 +478,8 @@ def build_lease_pdf(*,
         S["small"]
     ))
 
-    def _page(c, d): _draw_chrome(c, d, kind="LEASE", ref=reference)
+    kind = "PREMIUM" if is_premium else "LEASE"
+    def _page(c, d): _draw_chrome(c, d, kind=kind, ref=reference)
     doc.build(story, onFirstPage=_page, onLaterPages=_page)
     return buf.getvalue()
 
@@ -536,12 +623,15 @@ async def lease_contract_pdf(
     licensee_name  = lease.get("buyer_name")  or user.get("name") or user.get("username") or "Licensee"
     licensee_email = lease.get("buyer_email") or user.get("email") or ""
     price          = lease.get("price") or ""
-    reference      = "BF-LEASE-" + str(lease["_id"])
+    tier           = (lease.get("tier") or "basic").strip().lower()
+    reference      = ("BF-PREMIUM-" if tier == "premium" else "BF-LEASE-") + str(lease["_id"])
     date_str       = _gbp_date(lease.get("purchased_at") or datetime.utcnow())
 
     pdf = build_lease_pdf(
         beat_title=beat_title, producer=producer,
         licensee_name=licensee_name, licensee_email=licensee_email,
         price=price, reference=reference, date_str=date_str,
+        tier=tier,
     )
-    return _pdf_response(pdf, f"BeatFinder_Lease_{beat_title}_{lease_id}")
+    fname_prefix = "BeatFinder_Premium_Lease_" if tier == "premium" else "BeatFinder_Lease_"
+    return _pdf_response(pdf, f"{fname_prefix}{beat_title}_{lease_id}")
