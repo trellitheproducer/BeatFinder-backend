@@ -355,9 +355,15 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
                 "success_url":                                    FRONTEND_URL + "?lease=success&beat_id=" + beat_id,
                 "cancel_url":                                     FRONTEND_URL + "?lease=cancelled",
                 "metadata[beat_id]":                              beat_id,
+                "metadata[beat_title]":                           beat.get("title", ""),
                 "metadata[buyer_id]":                             str(user["_id"]),
                 "metadata[buyer_email]":                          user["email"],
+                "metadata[buyer_name]":                           user.get("name", user.get("username", "")),
+                "metadata[buyer_username]":                       user.get("username", ""),
                 "metadata[producer_id]":                          beat.get("producer_id", ""),
+                "metadata[producer_name]":                        beat.get("producer", ""),
+                "metadata[producer_username]":                    beat.get("producer_username", ""),
+                "metadata[price]":                                price_str,
                 "metadata[type]":                                 "lease",
             },
         )
@@ -399,9 +405,14 @@ async def lease_webhook(request: Request):
         if metadata.get("type") != "lease":
             return {"received": True}
 
-        beat_id      = metadata.get("beat_id")
-        buyer_id     = metadata.get("buyer_id")
-        buyer_email  = metadata.get("buyer_email")
+        beat_id           = metadata.get("beat_id")
+        buyer_id          = metadata.get("buyer_id")
+        buyer_email       = metadata.get("buyer_email")
+        buyer_name        = metadata.get("buyer_name", "")
+        buyer_username    = metadata.get("buyer_username", "")
+        producer_name     = metadata.get("producer_name", beat.get("producer", ""))
+        producer_username = metadata.get("producer_username", beat.get("producer_username", ""))
+        price             = metadata.get("price", beat.get("price", ""))
 
         if not all([beat_id, buyer_id]):
             return {"received": True}
@@ -414,14 +425,17 @@ async def lease_webhook(request: Request):
 
         # Add beat to buyer's purchased leases
         await db.purchased_leases.insert_one({
-            "buyer_id":    buyer_id,
-            "buyer_email": buyer_email,
-            "beat_id":     beat_id,
-            "beat_title":  beat.get("title"),
-            "beat_url":    beat.get("url"),
-            "producer":    beat.get("producer"),
-            "price":       beat.get("price"),
-            "purchased_at": datetime.utcnow(),
+            "buyer_id":           buyer_id,
+            "buyer_email":        buyer_email,
+            "buyer_name":         buyer_name,
+            "buyer_username":     buyer_username,
+            "beat_id":            beat_id,
+            "beat_title":         beat.get("title"),
+            "beat_url":           beat.get("url"),
+            "producer":           producer_name,
+            "producer_username":  producer_username,
+            "price":              price or beat.get("price"),
+            "purchased_at":       datetime.utcnow(),
         })
 
         # Increment download count
@@ -441,17 +455,43 @@ async def lease_webhook(request: Request):
 async def my_leases(request: Request, user=Depends(get_current_user)):
     db   = request.app.state.db
     docs = await db.purchased_leases.find({"buyer_id": str(user["_id"])}).sort("purchased_at", -1).to_list(100)
-    return [
-        {
-            "id":           str(d["_id"]),
-            "beat_title":   d.get("beat_title"),
-            "beat_url":     d.get("beat_url"),
-            "producer":     d.get("producer"),
-            "price":        d.get("price"),
-            "purchased_at": d.get("purchased_at", "").isoformat() if d.get("purchased_at") else "",
-        }
-        for d in docs
-    ]
+
+    # Enrich each lease with buyer/producer data from users collection
+    # This handles old leases that don't have these fields stored
+    result = []
+    for d in docs:
+        # Get buyer info from current user (they are the buyer)
+        buyer_name     = d.get("buyer_name") or user.get("name") or user.get("username", "")
+        buyer_username = d.get("buyer_username") or user.get("username", "")
+        buyer_email    = d.get("buyer_email") or user.get("email", "")
+
+        # Get producer info — look up from beat if missing
+        producer_name     = d.get("producer", "")
+        producer_username = d.get("producer_username", "")
+        if not producer_username and d.get("beat_id"):
+            try:
+                from bson import ObjectId as ObjId
+                beat_doc = await db.producer_beats.find_one({"_id": ObjId(d["beat_id"])}, {"producer_username": 1, "producer": 1})
+                if beat_doc:
+                    producer_name     = producer_name or beat_doc.get("producer", "")
+                    producer_username = beat_doc.get("producer_username", "")
+            except Exception:
+                pass
+
+        result.append({
+            "id":                str(d["_id"]),
+            "beat_id":           d.get("beat_id", ""),
+            "beat_title":        d.get("beat_title", ""),
+            "beat_url":          d.get("beat_url", ""),
+            "producer":          producer_name,
+            "producer_username": producer_username,
+            "buyer_name":        buyer_name,
+            "buyer_username":    buyer_username,
+            "buyer_email":       buyer_email,
+            "price":             d.get("price", ""),
+            "purchased_at":      d.get("purchased_at", "").isoformat() if d.get("purchased_at") else "",
+        })
+    return result
 
 
 # ── Sync Stripe account to all producer beats ─────────────────────────────────
