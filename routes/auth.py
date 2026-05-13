@@ -308,6 +308,12 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
                 "bpm":               b.get("bpm", 0),
                 "key":               b.get("key", ""),
                 "preview_start":     b.get("preview_start", 0),
+                # Two-tier lease fields — required by frontend to render Basic +
+                # Premium tier buttons. Defaults keep legacy beats working.
+                "basic_lease_price":   b.get("basic_lease_price", 50 if b.get("price", "free") != "free" else 0),
+                "premium_lease_price": b.get("premium_lease_price", 0),
+                "premium_sold":        bool(b.get("premium_sold", False)),
+                "premium_sold_to":     b.get("premium_sold_to"),
             }
             for b in beats
         ],
@@ -436,6 +442,12 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
                 "bpm":               b.get("bpm", 0),
                 "key":               b.get("key", ""),
                 "preview_start":     b.get("preview_start", 0),
+                # Two-tier lease fields — required by frontend to render Basic +
+                # Premium tier buttons. Defaults keep legacy beats working.
+                "basic_lease_price":   b.get("basic_lease_price", 50 if b.get("price", "free") != "free" else 0),
+                "premium_lease_price": b.get("premium_lease_price", 0),
+                "premium_sold":        bool(b.get("premium_sold", False)),
+                "premium_sold_to":     b.get("premium_sold_to"),
             }
             for b in beats
         ],
@@ -562,7 +574,8 @@ import os
 import httpx as httpx_mod
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-FRONTEND_URL   = os.getenv("FRONTEND_URL", "https://beat-finder-frontend.vercel.app")
+FRONTEND_URL   = os.getenv("FRONTEND_URL", "https://beatfinder.co.uk")
+FROM_EMAIL     = os.getenv("FROM_EMAIL", "BeatFinder <support@beatfinder.co.uk>")
 
 class ForgotPasswordRequest(BaseModel):
     email: str
@@ -598,7 +611,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request):
     async with httpx_mod.AsyncClient(timeout=10.0) as client:
         await client.post("https://api.resend.com/emails",
             headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
-            json={"from": "BeatFinder <onboarding@resend.dev>", "to": [body.email],
+            json={"from": FROM_EMAIL, "to": [body.email],
                   "subject": "Reset your BeatFinder password", "html": html})
 
     return {"success": True, "message": "If that email exists you will receive a reset link."}
