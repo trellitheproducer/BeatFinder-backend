@@ -655,6 +655,56 @@ async def sync_stripe_to_beats(request: Request, user=Depends(get_current_user))
     return {"success": True, "updated": result.modified_count}
 
 
+# ── Free-licence agreements (per-user, per-beat) ──────────────────────────────
+# Tracks which FREE beats a user has agreed to the licence for. Previously this
+# state was only in localStorage, which is sandboxed per-browser-context on iOS
+# (Safari tab and home-screen PWA have separate localStorages). Storing on the
+# server means the "Licence Agreed ✓" state persists across all devices and
+# browser contexts for any logged-in user.
+
+@router.post("/beats/{beat_id}/agree-licence")
+async def agree_free_licence(beat_id: str, request: Request, user=Depends(get_current_user)):
+    """Record that the user has agreed to the free licence for this beat.
+    Idempotent — calling multiple times is safe."""
+    db = request.app.state.db
+    user_id = str(user["_id"])
+    # Validate beat exists (and is actually free; we don't enforce free-only
+    # here because lease state is tracked separately in producer_leases — but
+    # we do check the beat is real).
+    try:
+        from bson import ObjectId
+        beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid beat id")
+    if not beat:
+        raise HTTPException(status_code=404, detail="Beat not found")
+
+    await db.free_licence_agreements.update_one(
+        {"user_id": user_id, "beat_id": beat_id},
+        {"$setOnInsert": {
+            "user_id":    user_id,
+            "beat_id":    beat_id,
+            "agreed_at":  datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+    return {"success": True, "beat_id": beat_id}
+
+
+@router.get("/my-free-licences")
+async def my_free_licences(request: Request, user=Depends(get_current_user)):
+    """Return the list of beat IDs this user has agreed to the free licence
+    for. Frontend uses this on app load to pre-populate the 'Licence Agreed ✓'
+    state across all browser contexts/devices."""
+    db = request.app.state.db
+    docs = await db.free_licence_agreements.find(
+        {"user_id": str(user["_id"])}
+    ).to_list(500)
+    return {
+        "beat_ids": [d.get("beat_id") for d in docs if d.get("beat_id")],
+    }
+
+
 # ── Update beat details ───────────────────────────────────────────────────────
 
 @router.post("/beats/{beat_id}/update")
