@@ -379,14 +379,18 @@ def build_lease_pdf(*,
              f'"Produced by {producer}" or "(Prod. by {producer})" in a visible '
              "location appropriate to the medium (track metadata, video "
              "description, liner notes or on-screen credits)."),
-            ("6. EXCLUSIVITY GUARANTEE",
+            ("6. EXCLUSIVITY & REVOCATION OF PRIOR BASIC LICENCES",
              "The Producer warrants that, from the date of this Agreement, the "
              "Beat shall not be sold, licensed, leased or otherwise distributed "
              "to any party other than the Licensee. The Producer shall remove "
-             "the Beat from public listings on BeatFinder. Existing basic-tier "
-             "licences (if any) sold prior to this Agreement remain valid as "
-             "non-exclusive uses only and do not affect the Licensee's "
-             "exclusivity for new purchases."),
+             "the Beat from public listings on BeatFinder. Upon execution of "
+             "this Premium Agreement, any and all prior Basic non-exclusive "
+             "licences in respect of the Beat are <b>automatically revoked</b> "
+             "and terminated with immediate effect; prior Basic licensees were "
+             "notified at the time of their purchase (Clause 6 of the Basic "
+             "Lease) that their licence would terminate on sale of the Premium "
+             "Lease, and accepted those terms. The Licensee accordingly "
+             "receives full and uncontested exclusive rights."),
             ("7. WARRANTIES",
              "The Producer warrants the Beat is their original work, free from "
              "third-party claims, and that they have full authority to grant "
@@ -445,21 +449,39 @@ def build_lease_pdf(*,
              f'"Produced by {producer}" or "(Prod. by {producer})" in a visible '
              "location appropriate to the medium (track metadata, video "
              "description, liner notes or on-screen credits)."),
-            ("6. WARRANTIES",
+            ("6. REVOCATION ON SALE OF EXCLUSIVE (PREMIUM) LEASE",
+             "<b>IMPORTANT — please read carefully.</b> The Licensee "
+             "acknowledges and accepts that this Basic Lease is a "
+             "non-exclusive licence. The Producer reserves the right to sell "
+             "an Exclusive (Premium) Lease of the Beat to a third party at any "
+             "time. In the event that such Premium Lease is purchased and "
+             "completed, this Basic Lease shall be <b>automatically revoked "
+             "and terminated with immediate effect</b>, and the Licensee shall: "
+             "(a) cease any further distribution, performance, streaming, "
+             "broadcast or commercial exploitation of the New Work; (b) make "
+             "best efforts to remove the New Work from active monetisation; "
+             "(c) NOT be entitled to a refund of the Fee paid for this Basic "
+             "Lease. Any prior good-faith distribution undertaken before the "
+             "revocation date is not retroactively unlawful, but no new "
+             "exploitation is permitted after revocation. By completing "
+             "payment for this Basic Lease, the Licensee expressly accepts "
+             "this risk."),
+            ("7. WARRANTIES",
              "The Producer warrants that the Beat is their original work, free "
              "from third-party claims, and that they have full authority to "
              "grant this Licence. The Licensee warrants that any vocals, lyrics "
              "or additional production they add are their original work."),
-            ("7. PLATFORM",
+            ("8. PLATFORM",
              "BeatFinder (beatfinder.co.uk) facilitates this Agreement and the "
              "associated payment as a platform provider only and is not a party "
              "to this Agreement. BeatFinder accepts no liability for any dispute "
              "between the Producer and Licensee."),
-            ("8. TERM AND TERMINATION",
-             "This Licence is perpetual unless terminated for breach. Upon "
-             "termination for breach, the Licensee must cease all distribution "
-             "of the New Work; any prior good-faith distribution remains licensed."),
-            ("9. GOVERNING LAW",
+            ("9. TERM AND TERMINATION",
+             "This Licence is perpetual unless terminated for breach or revoked "
+             "under Clause 6. Upon termination for breach, the Licensee must "
+             "cease all distribution of the New Work; any prior good-faith "
+             "distribution remains licensed."),
+            ("10. GOVERNING LAW",
              "This Agreement shall be governed by and construed in accordance "
              "with the laws of England and Wales, and the parties submit to the "
              "exclusive jurisdiction of the English courts."),
@@ -607,6 +629,14 @@ async def lease_contract_pdf(
     # Only the buyer (or an admin) may download
     if lease.get("buyer_id") != str(user["_id"]) and not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="Not your lease")
+
+    # Block contract issuance for voided basic leases — buyer must be informed
+    # that their licence was revoked when the exclusive premium was sold.
+    if lease.get("voided"):
+        raise HTTPException(
+            status_code=410,
+            detail="This basic lease was voided when an exclusive (premium) lease was sold to another buyer. As agreed at purchase (Clause 6 of the Basic Lease), no refund is issued."
+        )
 
     beat_title = lease.get("beat_title") or "Beat"
     producer   = lease.get("producer")   or "Producer"
