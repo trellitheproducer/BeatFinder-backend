@@ -579,10 +579,33 @@ async def proxy_download_options(beat_id: str):
         status_code=204,
         headers={
             "Access-Control-Allow-Origin":  "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, Range",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Disposition, Content-Type",
         }
     )
+
+
+@router.head("/beats/{beat_id}/file")
+async def proxy_download_head(beat_id: str, request: Request):
+    """Lightweight HEAD so the client can probe availability before
+    streaming. iOS Safari occasionally HEADs a media URL first."""
+    from bson import ObjectId
+    db = request.app.state.db
+    try:
+        beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid beat ID")
+    if not beat or not beat.get("url"):
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "audio/mpeg",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
 
 @router.get("/beats/{beat_id}/file")
 async def proxy_download(beat_id: str, request: Request):
@@ -599,45 +622,48 @@ async def proxy_download(beat_id: str, request: Request):
     if not url:
         raise HTTPException(status_code=404, detail="No file for this beat")
 
-    # Safe filename for Content-Disposition
+    # Build a safe filename. Strict ASCII fallback PLUS the RFC 5987 filename*
+    # form so all platforms (iOS, Android, desktop) get a sensible name even
+    # when titles contain non-ASCII characters.
     raw_title  = beat.get("title", "beat")
-    safe_title = _re.sub(r'[^\w\s\-]', '', raw_title).strip().replace(" ", "_") or "beat"
-    filename   = safe_title + ".mp3"
-    # RFC 5987 encoded filename for broad browser support
-    encoded    = filename.encode("utf-8").decode("ascii", errors="replace")
+    safe_ascii = _re.sub(r'[^A-Za-z0-9_\-]', '', raw_title.replace(" ", "_")) or "beat"
+    safe_ascii = safe_ascii[:80] + ".mp3"
+    from urllib.parse import quote as _urlquote
+    utf8_name  = _urlquote((raw_title.strip() or "beat") + ".mp3", safe="")
 
-    # Increment download count (fire-and-forget)
-    await db.producer_beats.update_one(
-        {"_id": ObjectId(beat_id)},
-        {"$inc": {"downloads": 1}}
-    )
-
-    # HEAD the Cloudinary URL first to get Content-Length if available
-    content_length = None
+    # Increment download count (fire-and-forget — must not block on error)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            head = await client.head(url)
-            cl   = head.headers.get("content-length")
-            if cl:
-                content_length = cl
+        await db.producer_beats.update_one(
+            {"_id": ObjectId(beat_id)},
+            {"$inc": {"downloads": 1}}
+        )
     except Exception:
         pass
 
     async def generate():
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # One client per request keeps memory bounded on small Render instances
+        timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    return
                 async for chunk in resp.aiter_bytes(65536):
                     yield chunk
 
+    # IMPORTANT: do not set Content-Length here. Cloudinary may serve chunked
+    # transfer encoding; if we set a Content-Length that doesn't match the
+    # actual streamed body, iOS Safari shows a blank page and aborts.
     headers = {
-        "Content-Disposition":    f'attachment; filename="{encoded}"',
-        "Content-Type":           "audio/mpeg",
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control":          "no-cache, no-store",
-        "Access-Control-Allow-Origin": "*",
+        "Content-Disposition": (
+            f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{utf8_name}"
+        ),
+        "Content-Type":            "audio/mpeg",
+        "X-Content-Type-Options":  "nosniff",
+        "Cache-Control":           "no-cache, no-store, must-revalidate",
+        "Pragma":                  "no-cache",
+        "Access-Control-Allow-Origin":   "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Disposition, Content-Type",
     }
-    if content_length:
-        headers["Content-Length"] = content_length
 
     return StreamingResponse(
         generate(),
