@@ -69,6 +69,12 @@ async def upload_beat(
     key:         str        = Form(""),
     description: str        = Form(""),
     preview_start: str      = Form("0"),
+    # Two-tier lease pricing (only applies when price != "free"):
+    #   - basic_lease_price: fixed at £50 — non-exclusive, 75% comp royalties to producer
+    #   - premium_lease_price: producer-chosen £100-£500 — EXCLUSIVE, 50% comp royalties
+    # When omitted the legacy single-price flow is used.
+    basic_lease_price:   str = Form("50"),
+    premium_lease_price: str = Form("0"),
     file:        UploadFile = File(...),
 ):
     if user.get("plan") != "producer":
@@ -103,6 +109,27 @@ async def upload_beat(
     except Exception:
         ps_val = 0
 
+    # Parse two-tier lease prices. For paid beats (price != "free") we enforce:
+    #   basic must be exactly 50 (fixed platform-wide standard)
+    #   premium must be between 100 and 500 inclusive (producer choice)
+    is_paid = (price or "free").strip().lower() not in ("free", "0", "£0", "£0.00", "")
+    basic_price_val   = 50
+    premium_price_val = 0
+    if is_paid:
+        try:
+            basic_price_val = int(float(str(basic_lease_price).replace("£", "").strip()))
+        except Exception:
+            basic_price_val = 50
+        if basic_price_val != 50:
+            basic_price_val = 50  # silently normalise — basic is always £50
+
+        try:
+            premium_price_val = int(float(str(premium_lease_price).replace("£", "").strip()))
+        except Exception:
+            premium_price_val = 0
+        if premium_price_val < 100 or premium_price_val > 500:
+            raise HTTPException(status_code=400, detail="Premium lease price must be between £100 and £500")
+
     beat = {
         "title":             title,
         "genre":             genre,
@@ -120,6 +147,12 @@ async def upload_beat(
         "bpm":               bpm_val,
         "key":               key.strip()[:20],
         "preview_start":     ps_val,
+        # Two-tier lease fields. For free beats these stay at 0/None.
+        "basic_lease_price":   basic_price_val if is_paid else 0,
+        "premium_lease_price": premium_price_val if is_paid else 0,
+        "premium_sold":        False,  # flips True once a premium lease is paid
+        "premium_sold_to":     None,   # buyer_id of the exclusive purchaser
+        "premium_sold_at":     None,
     }
     result = await db.producer_beats.insert_one(beat)
     beat["_id"] = str(result.inserted_id)
@@ -132,7 +165,10 @@ async def upload_beat(
 @router.get("/beats")
 async def list_producer_beats(request: Request):
     db   = request.app.state.db
-    docs = await db.producer_beats.find({}).sort("uploaded_at", -1).to_list(100)
+    # We expose premium_sold + premium_sold_to to the client so the frontend
+    # can hide sold-exclusively beats from everyone except buyer and producer.
+    # No server-side filtering needed — keeps endpoint public + simple.
+    docs = await db.producer_beats.find({}).sort("uploaded_at", -1).to_list(200)
 
     # Batch-fetch producer avatars
     producer_ids = list({d.get("producer_id") for d in docs if d.get("producer_id")})
@@ -170,6 +206,11 @@ async def list_producer_beats(request: Request):
             "key":               d.get("key", ""),
             "preview_start":     d.get("preview_start", 0),
             "uploaded_at":       d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
+            # Two-tier fields. Defaults handle existing beats without these.
+            "basic_lease_price":   d.get("basic_lease_price", 50 if d.get("price", "free") != "free" else 0),
+            "premium_lease_price": d.get("premium_lease_price", 0),
+            "premium_sold":        bool(d.get("premium_sold", False)),
+            "premium_sold_to":     d.get("premium_sold_to"),
         }
         for d in docs
     ]
@@ -193,6 +234,11 @@ async def my_beats(request: Request, user=Depends(get_current_user)):
             "key":           d.get("key", ""),
             "preview_start": d.get("preview_start", 0),
             "uploaded_at":   d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
+            "basic_lease_price":   d.get("basic_lease_price", 50 if d.get("price", "free") != "free" else 0),
+            "premium_lease_price": d.get("premium_lease_price", 0),
+            "premium_sold":        bool(d.get("premium_sold", False)),
+            "premium_sold_to":     d.get("premium_sold_to"),
+            "premium_sold_at":     d.get("premium_sold_at", "").isoformat() if d.get("premium_sold_at") and hasattr(d.get("premium_sold_at"), "isoformat") else (d.get("premium_sold_at") or ""),
         }
         for d in docs
     ]
@@ -303,7 +349,25 @@ async def stripe_status(request: Request, user=Depends(get_current_user)):
 
 @router.post("/beats/{beat_id}/buy-lease")
 async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_user)):
+    """Initiate a Stripe checkout for either tier:
+       - tier=basic   → £50 fixed,  non-exclusive, 75% royalties to producer
+       - tier=premium → £100-£500, EXCLUSIVE, 50% royalties to producer
+       Premium tier becomes unavailable once sold to a buyer."""
     from bson import ObjectId
+
+    # Accept tier from JSON body OR query param. Default = "basic".
+    tier = "basic"
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("tier"):
+            tier = str(body["tier"]).strip().lower()
+    except Exception:
+        pass
+    if not tier:
+        tier = request.query_params.get("tier", "basic").strip().lower()
+    if tier not in ("basic", "premium"):
+        raise HTTPException(status_code=400, detail="tier must be 'basic' or 'premium'")
+
     db   = request.app.state.db
     beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
 
@@ -314,12 +378,28 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     if price_str == "free":
         raise HTTPException(status_code=400, detail="This beat is free - no purchase needed")
 
-    # Parse price (e.g. "£50" or "50")
-    price_clean = price_str.replace("£", "").replace("$", "").strip()
-    try:
-        price_gbp = float(price_clean)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid price format")
+    # Block premium purchase if already sold
+    if tier == "premium" and beat.get("premium_sold"):
+        raise HTTPException(status_code=409, detail="The premium (exclusive) lease for this beat has already been sold")
+
+    # Determine the correct price for the selected tier.
+    # For legacy beats without explicit tier prices, fall back to the beat's
+    # primary price for the basic tier and reject premium purchases.
+    if tier == "basic":
+        price_gbp = float(beat.get("basic_lease_price") or 0)
+        if price_gbp <= 0:
+            # Legacy beat — parse "price" field (e.g. "£50")
+            try:
+                price_gbp = float(str(price_str).replace("£", "").replace("$", "").strip())
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid price format")
+        if price_gbp != 50.0:
+            # Basic tier is always £50 platform-wide. Normalise.
+            price_gbp = 50.0
+    else:  # premium
+        price_gbp = float(beat.get("premium_lease_price") or 0)
+        if price_gbp < 100 or price_gbp > 500:
+            raise HTTPException(status_code=400, detail="This beat does not offer a premium lease, or its premium price is invalid")
 
     # Always look up the producer's current Stripe account from users collection
     producer_account = beat.get("stripe_account_id")
@@ -338,6 +418,11 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
 
     price_pence       = int(price_gbp * 100)
     platform_fee_p    = max(1, int(price_pence * PLATFORM_FEE / 100))
+    product_name      = beat.get("title", "Beat Lease")
+    if tier == "premium":
+        product_name = product_name + " — Premium Exclusive Lease"
+    else:
+        product_name = product_name + " — Basic Lease"
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(
@@ -346,7 +431,7 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
             data={
                 "mode":                            "payment",
                 "line_items[0][price_data][currency]":            "gbp",
-                "line_items[0][price_data][product_data][name]":  beat.get("title", "Beat Lease"),
+                "line_items[0][price_data][product_data][name]":  product_name,
                 "line_items[0][price_data][unit_amount]":         str(price_pence),
                 "line_items[0][quantity]":                        "1",
                 "customer_email":                                 user["email"],
@@ -363,8 +448,9 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
                 "metadata[producer_id]":                          beat.get("producer_id", ""),
                 "metadata[producer_name]":                        beat.get("producer", ""),
                 "metadata[producer_username]":                    beat.get("producer_username", ""),
-                "metadata[price]":                                price_str,
+                "metadata[price]":                                "£" + str(int(price_gbp)),
                 "metadata[type]":                                 "lease",
+                "metadata[tier]":                                 tier,
             },
         )
 
@@ -410,9 +496,12 @@ async def lease_webhook(request: Request):
         buyer_email       = metadata.get("buyer_email")
         buyer_name        = metadata.get("buyer_name", "")
         buyer_username    = metadata.get("buyer_username", "")
-        producer_name     = metadata.get("producer_name", beat.get("producer", ""))
-        producer_username = metadata.get("producer_username", beat.get("producer_username", ""))
-        price             = metadata.get("price", beat.get("price", ""))
+        producer_name     = metadata.get("producer_name", "")
+        producer_username = metadata.get("producer_username", "")
+        price             = metadata.get("price", "")
+        tier              = (metadata.get("tier") or "basic").strip().lower()
+        if tier not in ("basic", "premium"):
+            tier = "basic"
 
         if not all([beat_id, buyer_id]):
             return {"received": True}
@@ -422,6 +511,21 @@ async def lease_webhook(request: Request):
         beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
         if not beat:
             return {"received": True}
+
+        # Fallback producer info from beat doc if metadata missing
+        if not producer_name:
+            producer_name = beat.get("producer", "")
+        if not producer_username:
+            producer_username = beat.get("producer_username", "")
+        if not price:
+            price = beat.get("price", "")
+
+        # Guard: refuse to double-sell a premium (exclusive) lease.
+        # If a race happened and another buyer's webhook arrived first, refund
+        # would be needed — but we still don't grant exclusive twice.
+        if tier == "premium" and beat.get("premium_sold") and beat.get("premium_sold_to") != buyer_id:
+            print(f"[Lease] WARNING: duplicate premium purchase attempt for beat {beat_id} by {buyer_email} — already sold to {beat.get('premium_sold_to')}")
+            return {"received": True, "warning": "premium already sold"}
 
         # Add beat to buyer's purchased leases
         await db.purchased_leases.insert_one({
@@ -434,17 +538,27 @@ async def lease_webhook(request: Request):
             "beat_url":           beat.get("url"),
             "producer":           producer_name,
             "producer_username":  producer_username,
-            "price":              price or beat.get("price"),
+            "price":              price,
+            "tier":               tier,
             "purchased_at":       datetime.utcnow(),
         })
 
         # Increment download count
+        update_ops = {"$inc": {"downloads": 1}}
+
+        # For premium tier — flip exclusivity flag so no one else can buy or see.
+        if tier == "premium":
+            update_ops.setdefault("$set", {})
+            update_ops["$set"]["premium_sold"]    = True
+            update_ops["$set"]["premium_sold_to"] = buyer_id
+            update_ops["$set"]["premium_sold_at"] = datetime.utcnow()
+
         await db.producer_beats.update_one(
             {"_id": ObjectId(beat_id)},
-            {"$inc": {"downloads": 1}}
+            update_ops
         )
 
-        print("[Lease] Beat " + beat_id + " purchased by " + buyer_email)
+        print(f"[Lease] Beat {beat_id} purchased ({tier}) by {buyer_email}")
 
     return {"received": True}
 
@@ -489,6 +603,7 @@ async def my_leases(request: Request, user=Depends(get_current_user)):
             "buyer_username":    buyer_username,
             "buyer_email":       buyer_email,
             "price":             d.get("price", ""),
+            "tier":              d.get("tier", "basic"),
             "purchased_at":      d.get("purchased_at", "").isoformat() if d.get("purchased_at") else "",
         })
     return result
@@ -520,6 +635,12 @@ async def update_beat(beat_id: str, request: Request, user=Depends(get_current_u
     body = await request.json()
     db   = request.app.state.db
 
+    # Look up the beat first so we know whether premium has been sold
+    beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id), "producer_id": str(user["_id"])})
+    if not beat:
+        raise HTTPException(status_code=404, detail="Beat not found or not yours")
+    premium_sold = bool(beat.get("premium_sold"))
+
     update_fields = {}
     if body.get("title"):       update_fields["title"]       = body["title"].strip()
     if body.get("genre"):       update_fields["genre"]        = body["genre"].strip()
@@ -536,6 +657,21 @@ async def update_beat(beat_id: str, request: Request, user=Depends(get_current_u
             ps = int(body["preview_start"])
             if ps >= 0: update_fields["preview_start"] = ps
         except: pass
+
+    # Two-tier lease price updates. Basic is locked to 50. Premium can be
+    # changed by the producer between 100 and 500, but ONLY if not yet sold.
+    if "basic_lease_price" in body:
+        update_fields["basic_lease_price"] = 50  # always £50
+    if "premium_lease_price" in body:
+        if premium_sold:
+            raise HTTPException(status_code=409, detail="Premium lease has already been sold — price is locked")
+        try:
+            pp = int(float(str(body["premium_lease_price"]).replace("£", "").strip()))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid premium lease price")
+        if pp < 100 or pp > 500:
+            raise HTTPException(status_code=400, detail="Premium lease price must be between £100 and £500")
+        update_fields["premium_lease_price"] = pp
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nothing to update")
