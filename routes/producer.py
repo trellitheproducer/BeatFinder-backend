@@ -771,8 +771,50 @@ async def proxy_download_head(beat_id: str, request: Request):
     )
 
 
+async def _try_get_user(request: Request):
+    """Optional auth — returns the user dict if a valid token is in the
+    Authorization header OR a `?token=…` query param, else None.
+    Used by the MP3 download endpoint where iOS sometimes strips headers
+    from media-download requests so the frontend includes a fallback token
+    in the query string."""
+    from auth import get_current_user as _gcu
+    token = ""
+    auth_hdr = request.headers.get("Authorization", "")
+    if auth_hdr.lower().startswith("bearer "):
+        token = auth_hdr.split(" ", 1)[1].strip()
+    if not token:
+        token = request.query_params.get("token", "").strip()
+    if not token:
+        return None
+    # Build a synthetic request-like shim so we can reuse the existing
+    # token-verification logic without re-implementing it. We add the token
+    # back into Authorization header for the helper to read.
+    try:
+        # Rewrite the request's authorization header in-place for this call
+        new_headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() != b"authorization"]
+        new_headers.append((b"authorization", ("Bearer " + token).encode()))
+        request.scope["headers"] = new_headers
+        return await _gcu(request)
+    except Exception:
+        return None
+
+
 @router.get("/beats/{beat_id}/file")
 async def proxy_download(beat_id: str, request: Request):
+    """Stream the beat MP3 to the buyer.
+
+    Access control:
+      • FREE beats — any signed-in user can download. The frontend records
+        contract acceptance before triggering this endpoint.
+      • PAID (basic/premium) beats — the requester MUST own a non-voided
+        lease in `purchased_leases`.
+      • The beat's producer can always download their own beat.
+
+    Stripe is the source of truth: a row in `purchased_leases` is only
+    inserted by the `lease-webhook` once `checkout.session.completed`
+    fires from Stripe. Cancelled or failed payments therefore cannot
+    grant access here.
+    """
     from bson import ObjectId
     db   = request.app.state.db
     try:
@@ -785,6 +827,29 @@ async def proxy_download(beat_id: str, request: Request):
     url = beat.get("url", "")
     if not url:
         raise HTTPException(status_code=404, detail="No file for this beat")
+
+    # ── ACCESS GATE ──────────────────────────────────────────────────────────
+    requesting_user = await _try_get_user(request)
+
+    price_str = (beat.get("price") or "free")
+    is_paid_beat = price_str != "free"
+    is_owner = bool(requesting_user and str(requesting_user.get("_id")) == beat.get("producer_id"))
+
+    if is_paid_beat and not is_owner:
+        if not requesting_user:
+            raise HTTPException(status_code=401, detail="Sign in to download paid beats")
+        # Look up the buyer's lease for this beat. Must exist and not be voided.
+        lease = await db.purchased_leases.find_one({
+            "beat_id":  beat_id,
+            "buyer_id": str(requesting_user["_id"]),
+        })
+        if not lease:
+            raise HTTPException(status_code=402, detail="Purchase required — no lease on file for this beat")
+        if lease.get("voided"):
+            raise HTTPException(status_code=410, detail="Your lease for this beat was revoked when the exclusive (premium) lease was sold to another buyer.")
+    elif not is_paid_beat and not requesting_user:
+        # Free beats still require sign-in so we can audit who downloaded.
+        raise HTTPException(status_code=401, detail="Sign in to download")
 
     # Build a safe filename. Strict ASCII fallback PLUS the RFC 5987 filename*
     # form so all platforms (iOS, Android, desktop) get a sensible name even
