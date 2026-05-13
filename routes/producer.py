@@ -62,16 +62,21 @@ async def upload_to_cloudinary(file_bytes: bytes, filename: str) -> str:
 async def upload_beat(
     request: Request,
     user=Depends(get_current_user),
-    title:  str        = Form(...),
-    genre:  str        = Form(...),
-    price:  str        = Form("free"),
-    file:   UploadFile = File(...),
+    title:       str        = Form(...),
+    genre:       str        = Form(...),
+    price:       str        = Form("free"),
+    bpm:         str        = Form("0"),
+    key:         str        = Form(""),
+    description: str        = Form(""),
+    preview_start: str      = Form("0"),
+    file:        UploadFile = File(...),
 ):
     if user.get("plan") != "producer":
         raise HTTPException(status_code=403, detail="Producer Pro plan required to upload beats")
 
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only MP3 files are supported")
+    allowed_ext = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".aiff", ".opus")
+    if not any(file.filename.lower().endswith(e) for e in allowed_ext):
+        raise HTTPException(status_code=400, detail="Only MP3/WAV audio files are supported")
 
     file_bytes = await file.read()
     if len(file_bytes) > 50 * 1024 * 1024:
@@ -82,6 +87,21 @@ async def upload_beat(
     db   = request.app.state.db
     user_doc = await db.users.find_one({"_id": user["_id"]})
     stripe_account_id = user_doc.get("stripe_account_id") if user_doc else None
+
+    # Parse bpm safely
+    try:
+        bpm_val = int(bpm)
+        if not (40 <= bpm_val <= 300):
+            bpm_val = 0
+    except Exception:
+        bpm_val = 0
+
+    # Parse preview_start safely
+    try:
+        ps_val = int(preview_start)
+        if ps_val < 0: ps_val = 0
+    except Exception:
+        ps_val = 0
 
     beat = {
         "title":             title,
@@ -96,6 +116,10 @@ async def upload_beat(
         "uploaded_at":       datetime.utcnow(),
         "downloads":         0,
         "playCount":         0,
+        "description":       description.strip()[:500],
+        "bpm":               bpm_val,
+        "key":               key.strip()[:20],
+        "preview_start":     ps_val,
     }
     result = await db.producer_beats.insert_one(beat)
     beat["_id"] = str(result.inserted_id)
@@ -141,6 +165,10 @@ async def list_producer_beats(request: Request):
             "stripe_account_id": d.get("stripe_account_id"),
             "downloads":         d.get("downloads", 0),
             "playCount":         d.get("playCount", 0),
+            "description":       d.get("description", ""),
+            "bpm":               d.get("bpm", 0),
+            "key":               d.get("key", ""),
+            "preview_start":     d.get("preview_start", 0),
             "uploaded_at":       d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
         }
         for d in docs
@@ -155,12 +183,16 @@ async def my_beats(request: Request, user=Depends(get_current_user)):
     docs = await db.producer_beats.find({"producer_id": str(user["_id"])}).sort("uploaded_at", -1).to_list(100)
     return [
         {
-            "id":          str(d["_id"]),
-            "title":       d.get("title"),
-            "genre":       d.get("genre"),
-            "price":       d.get("price", "free"),
-            "downloads":   d.get("downloads", 0),
-            "uploaded_at": d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
+            "id":            str(d["_id"]),
+            "title":         d.get("title"),
+            "genre":         d.get("genre"),
+            "price":         d.get("price", "free"),
+            "downloads":     d.get("downloads", 0),
+            "description":   d.get("description", ""),
+            "bpm":           d.get("bpm", 0),
+            "key":           d.get("key", ""),
+            "preview_start": d.get("preview_start", 0),
+            "uploaded_at":   d.get("uploaded_at", "").isoformat() if d.get("uploaded_at") else "",
         }
         for d in docs
     ]
@@ -449,9 +481,21 @@ async def update_beat(beat_id: str, request: Request, user=Depends(get_current_u
     db   = request.app.state.db
 
     update_fields = {}
-    if body.get("title"):  update_fields["title"]  = body["title"].strip()
-    if body.get("genre"):  update_fields["genre"]  = body["genre"].strip()
-    if body.get("price"):  update_fields["price"]  = body["price"].strip()
+    if body.get("title"):       update_fields["title"]       = body["title"].strip()
+    if body.get("genre"):       update_fields["genre"]        = body["genre"].strip()
+    if body.get("price"):       update_fields["price"]        = body["price"].strip()
+    if "description" in body:   update_fields["description"]  = body["description"].strip()[:500]
+    if "bpm" in body:
+        try:
+            bpm = int(body["bpm"])
+            if 40 <= bpm <= 300: update_fields["bpm"] = bpm
+        except: pass
+    if "key" in body:           update_fields["key"]          = body["key"].strip()[:20]
+    if "preview_start" in body:
+        try:
+            ps = int(body["preview_start"])
+            if ps >= 0: update_fields["preview_start"] = ps
+        except: pass
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="Nothing to update")
