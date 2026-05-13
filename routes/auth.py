@@ -307,6 +307,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
                 "description":       b.get("description", ""),
                 "bpm":               b.get("bpm", 0),
                 "key":               b.get("key", ""),
+                "preview_start":     b.get("preview_start", 0),
             }
             for b in beats
         ],
@@ -434,6 +435,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
                 "description":       b.get("description", ""),
                 "bpm":               b.get("bpm", 0),
                 "key":               b.get("key", ""),
+                "preview_start":     b.get("preview_start", 0),
             }
             for b in beats
         ],
