@@ -1072,6 +1072,13 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                     "likeCount":    p.get("likeCount", 0),
                     "commentCount": p.get("commentCount", 0),
                     "repostCount":  p.get("repostCount", 0),
+                    # Link preview fields — empty strings when the post
+                    # didn't include a URL, otherwise stored OG metadata.
+                    "linkUrl":         p.get("linkUrl", ""),
+                    "linkTitle":       p.get("linkTitle", ""),
+                    "linkDescription": p.get("linkDescription", ""),
+                    "linkImage":       p.get("linkImage", ""),
+                    "linkSiteName":    p.get("linkSiteName", ""),
                     "id":           str(p.get("_id")),
                     "created_at":   _iso_utc(p.get("createdAt") or p.get("created_at")),
                 }
