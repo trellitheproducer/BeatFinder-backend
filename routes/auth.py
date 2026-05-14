@@ -1043,20 +1043,26 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
             post_docs = await posts_coll.find(post_query).sort([
                 ("createdAt", -1), ("created_at", -1),
             ]).limit(fetch_each).to_list(fetch_each)
-            for p in post_docs:
-                created = p.get("createdAt") or p.get("created_at")
-                # Resolve author info: prefer user_map by id, fall back to fields on the post
+
+            # If any of these posts are reposts, batch-fetch their originals
+            # so we can inline the original content. Reposts have
+            # `repost_of: <original_id>` set.
+            originals_map = {}
+            original_ids = [p.get("repost_of") for p in post_docs if p.get("repost_of")]
+            if original_ids:
+                orig_docs = await posts_coll.find(
+                    {"_id": {"$in": original_ids}}
+                ).to_list(len(original_ids))
+                originals_map = {str(o["_id"]): o for o in orig_docs}
+
+            def _post_payload(p, created):
+                """Build the per-post payload used by the feed. Inline so it
+                shares the user_map / originals_map from this closure."""
                 author_id = str(p.get("user_id") or p.get("author_id") or "")
                 ainfo = user_map.get(author_id, {})
-                items.append({
-                    "kind":         "post",
-                    "id":           str(p.get("_id")),
-                    "created_at":   _iso_utc(created),
-                    "_sort_ts":     created.timestamp() if hasattr(created, "timestamp") else 0,
-                    # User
+                return {
                     "username":     ainfo.get("username", p.get("username", "")),
                     "user_avatar":  ainfo.get("avatarUrl", p.get("avatarUrl", "")),
-                    # Post fields
                     "text":         p.get("text", ""),
                     "images":       p.get("images", []),
                     "type":         p.get("type", "status"),
@@ -1065,7 +1071,32 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                     "caption":      p.get("caption", ""),
                     "likeCount":    p.get("likeCount", 0),
                     "commentCount": p.get("commentCount", 0),
-                })
+                    "repostCount":  p.get("repostCount", 0),
+                    "id":           str(p.get("_id")),
+                    "created_at":   _iso_utc(p.get("createdAt") or p.get("created_at")),
+                }
+
+            for p in post_docs:
+                created = p.get("createdAt") or p.get("created_at")
+                base = _post_payload(p, created)
+                item = {
+                    "kind":         "post",
+                    "id":           str(p.get("_id")),
+                    "created_at":   _iso_utc(created),
+                    "_sort_ts":     created.timestamp() if hasattr(created, "timestamp") else 0,
+                }
+                item.update(base)
+                # Repost handling — if this doc is a repost, attach the
+                # underlying original as `original_post` so the client can
+                # render its content with the reposter's identity above.
+                if p.get("repost_of"):
+                    item["repost_of"] = p["repost_of"]
+                    orig = originals_map.get(p["repost_of"])
+                    if orig:
+                        # Original's like/comment/repost counts go in too —
+                        # the client uses them for the action bar.
+                        item["original_post"] = _post_payload(orig, orig.get("createdAt"))
+                items.append(item)
         except Exception:
             pass
 
