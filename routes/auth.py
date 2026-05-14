@@ -722,6 +722,150 @@ async def unfollow_user(username: str, request: Request, user=Depends(get_curren
     return {"success": True, "following": False}
 
 
+# ── Activity feed: new uploads + posts from followed users ─────
+# Returns a merged, time-sorted stream of activity from people the user
+# follows. Two kinds of items:
+#   - kind="beat":  a new producer beat upload (Producer Pro accounts)
+#   - kind="post":  a status, music, or video post (any account that posts)
+# Each item carries a 'created_at' ISO timestamp so the client can sort
+# or group as needed. Returns [] when the user follows nobody or has
+# no recent activity from their network.
+@router.get("/feed")
+async def activity_feed(request: Request, limit: int = 30, user=Depends(get_current_user)):
+    db = request.app.state.db
+    user_id = str(user["_id"])
+    limit = max(1, min(int(limit), 100))
+
+    # Get list of user IDs the current user follows
+    follow_docs = await db.follows.find({"follower_id": user_id}).to_list(500)
+    following_ids = [f["following_id"] for f in follow_docs]
+    if not following_ids:
+        return []
+
+    # Convert to ObjectId list for joining against users collection
+    from bson import ObjectId as _ObjId
+    valid_pids = []
+    for pid in following_ids:
+        try: valid_pids.append(_ObjId(pid))
+        except Exception: pass
+
+    # Batch-fetch followed user details up front so we have avatar/username
+    # for every item without per-item queries.
+    user_map = {}
+    if valid_pids:
+        followed = await db.users.find(
+            {"_id": {"$in": valid_pids}},
+            {"avatarUrl": 1, "username": 1, "name": 1, "plan": 1}
+        ).to_list(500)
+        for f in followed:
+            user_map[str(f["_id"])] = {
+                "username":  f.get("username", ""),
+                "name":      f.get("name", ""),
+                "avatarUrl": f.get("avatarUrl", ""),
+                "plan":      f.get("plan", "free"),
+            }
+
+    items = []
+
+    # 1) Recent beat uploads from followed producers
+    try:
+        beat_docs = await db.producer_beats.find(
+            {"producer_id": {"$in": following_ids}}
+        ).sort("uploaded_at", -1).limit(limit).to_list(limit)
+        for b in beat_docs:
+            pid = b.get("producer_id", "")
+            pinfo = user_map.get(pid, {})
+            uploaded_at = b.get("uploaded_at")
+            items.append({
+                "kind":              "beat",
+                "id":                str(b["_id"]),
+                "created_at":        uploaded_at.isoformat() if uploaded_at else "",
+                "_sort_ts":          uploaded_at.timestamp() if uploaded_at else 0,
+                # User
+                "username":          pinfo.get("username", b.get("producer_username", "")),
+                "user_avatar":       pinfo.get("avatarUrl", b.get("producer_avatar", "")),
+                # Beat fields (matching /api/producer/beats shape)
+                "title":             b.get("title"),
+                "genre":             b.get("genre"),
+                "price":             b.get("price", "free"),
+                "url":               b.get("url"),
+                "producer":          b.get("producer"),
+                "producer_id":       pid,
+                "producer_username": pinfo.get("username", b.get("producer_username", "")),
+                "producer_avatar":   pinfo.get("avatarUrl", b.get("producer_avatar", "")),
+                "stripe_account_id": b.get("stripe_account_id"),
+                "downloads":         b.get("downloads", 0),
+                "playCount":         b.get("playCount", 0),
+                "description":       b.get("description", ""),
+                "bpm":               b.get("bpm", 0),
+                "key":               b.get("key", ""),
+                "preview_start":     b.get("preview_start", 0),
+                "uploaded_at":       uploaded_at.isoformat() if uploaded_at else "",
+                "basic_lease_price":   b.get("basic_lease_price", 50 if b.get("price", "free") != "free" else 0),
+                "premium_lease_price": b.get("premium_lease_price", 0),
+                "premium_sold":        bool(b.get("premium_sold", False)),
+                "premium_sold_to":     b.get("premium_sold_to"),
+            })
+    except Exception:
+        pass
+
+    # 2) Recent posts (status / music / video) from any followed user.
+    # Tries a few common collection names since the posts router may
+    # use any of these. Silently skips if none exist or query errors.
+    posts_coll = None
+    for name in ("posts", "user_posts", "social_posts"):
+        try:
+            if name in await db.list_collection_names():
+                posts_coll = db[name]
+                break
+        except Exception:
+            continue
+    if posts_coll is not None:
+        try:
+            # Posts may store author by user_id (ObjectId or str), or by username.
+            # We support both.
+            post_query = {
+                "$or": [
+                    {"user_id":   {"$in": following_ids}},
+                    {"author_id": {"$in": following_ids}},
+                    {"username":  {"$in": [u.get("username") for u in user_map.values() if u.get("username")]}},
+                ]
+            }
+            post_docs = await posts_coll.find(post_query).sort("created_at", -1).limit(limit).to_list(limit)
+            for p in post_docs:
+                created = p.get("created_at") or p.get("createdAt")
+                # Resolve author info: prefer user_map by id, fall back to fields on the post
+                author_id = str(p.get("user_id") or p.get("author_id") or "")
+                ainfo = user_map.get(author_id, {})
+                items.append({
+                    "kind":         "post",
+                    "id":           str(p.get("_id")),
+                    "created_at":   created.isoformat() if hasattr(created, "isoformat") else (str(created) if created else ""),
+                    "_sort_ts":     created.timestamp() if hasattr(created, "timestamp") else 0,
+                    # User
+                    "username":     ainfo.get("username", p.get("username", "")),
+                    "user_avatar":  ainfo.get("avatarUrl", p.get("avatarUrl", "")),
+                    # Post fields
+                    "text":         p.get("text", ""),
+                    "images":       p.get("images", []),
+                    "type":         p.get("type", "status"),
+                    "embedUrl":     p.get("embedUrl", ""),
+                    "videoUrl":     p.get("videoUrl", ""),
+                    "caption":      p.get("caption", ""),
+                    "likeCount":    p.get("likeCount", 0),
+                    "commentCount": p.get("commentCount", 0),
+                })
+        except Exception:
+            pass
+
+    # Sort all items newest-first by their timestamp, then strip internal field
+    items.sort(key=lambda x: x.get("_sort_ts", 0), reverse=True)
+    items = items[:limit]
+    for it in items:
+        it.pop("_sort_ts", None)
+    return items
+
+
 # ── Change password ───────────────────────────────────────────────
 class ChangePasswordRequest(BaseModel):
     current_password: str
