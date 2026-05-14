@@ -23,7 +23,7 @@ from routes.ai import router as ai_router
 from routes.notifications import router as notifications_router
 from routes.contracts import router as contracts_router
 from routes.bpm import router as bpm_router
-from support_routes import router as support_router
+from routes.support_routes import router as support_router
 
 load_dotenv()
 
