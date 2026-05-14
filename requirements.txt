@@ -11,3 +11,13 @@ pydantic[email]
 email-validator
 python-multipart
 reportlab>=4.0.0
+# ── BPM detection ─────────────────────────────────────────────────────────
+# librosa needs numpy + scipy + numba transitively. Pinned to versions that
+# install cleanly on Render's Python 3.11 image without needing custom wheels.
+# soundfile handles WAV/FLAC/OGG natively; audioread provides MP3/M4A via
+# Render's pre-installed ffmpeg/libav.
+librosa==0.10.2.post1
+soundfile==0.12.1
+audioread==3.0.1
+numpy>=1.24,<2.0
+scipy>=1.11,<1.14
