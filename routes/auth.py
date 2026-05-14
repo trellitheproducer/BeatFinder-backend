@@ -949,6 +949,13 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
         except Exception: pass
 
     user_map = {}
+    # We also key by username — some legacy posts have user_id stored
+    # as an ObjectId while user docs have string _id (or vice-versa),
+    # which silently broke the _id-based lookup and stripped plan/
+    # avatar off the payload. Looking up by username instead is robust
+    # to any ID-format mismatch since posts always carry the author's
+    # username verbatim.
+    user_map_by_name = {}
     or_clauses = [{"_id": {"$in": feed_user_ids}}]  # string _ids
     if objid_pids:
         or_clauses.append({"_id": {"$in": objid_pids}})  # legacy ObjectId _ids
@@ -958,12 +965,15 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
         {"avatarUrl": 1, "username": 1, "name": 1, "plan": 1}
     ).to_list(500)
     for f in followed:
-        user_map[str(f["_id"])] = {
+        info = {
             "username":  f.get("username", ""),
             "name":      f.get("name", ""),
             "avatarUrl": f.get("avatarUrl", ""),
             "plan":      f.get("plan", "free"),
         }
+        user_map[str(f["_id"])] = info
+        if info["username"]:
+            user_map_by_name[info["username"]] = info
 
     items = []
 
@@ -1055,11 +1065,46 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                 ).to_list(len(original_ids))
                 originals_map = {str(o["_id"]): o for o in orig_docs}
 
+                # Top up user_map_by_name with any original-post authors
+                # we don't already know about (you can repost someone you
+                # don't follow). Without this, the inlined original_post
+                # payload would have an empty plan and the frontend
+                # wouldn't render the reposted user's verified tick.
+                missing_names = set()
+                for o in orig_docs:
+                    nm = o.get("username", "")
+                    if nm and nm not in user_map_by_name:
+                        missing_names.add(nm)
+                if missing_names:
+                    extra_docs = await db.users.find(
+                        {"username": {"$in": list(missing_names)}},
+                        {"avatarUrl": 1, "username": 1, "name": 1, "plan": 1},
+                    ).to_list(length=len(missing_names) + 10)
+                    for x in extra_docs:
+                        info = {
+                            "username":  x.get("username", ""),
+                            "name":      x.get("name", ""),
+                            "avatarUrl": x.get("avatarUrl", ""),
+                            "plan":      x.get("plan", "free"),
+                        }
+                        user_map[str(x["_id"])] = info
+                        if info["username"]:
+                            user_map_by_name[info["username"]] = info
+
             def _post_payload(p, created):
                 """Build the per-post payload used by the feed. Inline so it
                 shares the user_map / originals_map from this closure."""
                 author_id = str(p.get("user_id") or p.get("author_id") or "")
-                ainfo = user_map.get(author_id, {})
+                ainfo = user_map.get(author_id) or {}
+                # Fallback by username — covers posts whose user_id is in
+                # a different format than the user doc's _id (legacy
+                # ObjectId vs new string-_id mismatch). Without this the
+                # plan field gets stripped for those authors and the
+                # frontend's verified-tick logic silently fails.
+                if not ainfo:
+                    post_username = p.get("username", "")
+                    if post_username:
+                        ainfo = user_map_by_name.get(post_username, {}) or {}
                 return {
                     "username":     ainfo.get("username", p.get("username", "")),
                     "user_avatar":  ainfo.get("avatarUrl", p.get("avatarUrl", "")),
