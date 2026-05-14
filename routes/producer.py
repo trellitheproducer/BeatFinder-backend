@@ -705,6 +705,50 @@ async def my_free_licences(request: Request, user=Depends(get_current_user)):
     }
 
 
+@router.get("/debug-free-licences")
+async def debug_free_licences(request: Request, user=Depends(get_current_user)):
+    """TEMPORARY DIAGNOSTIC ENDPOINT — returns raw collection contents so we
+    can see what's actually stored vs. what the my-free-licences filter
+    returns. Compares: total docs in collection, docs matching this user_id,
+    sample docs for inspection. Remove after sync issue is debugged."""
+    db = request.app.state.db
+    user_id_str = str(user["_id"])
+    # Total count regardless of user
+    total = await db.free_licence_agreements.count_documents({})
+    # Docs matching this user by various possible formats
+    by_str = await db.free_licence_agreements.find({"user_id": user_id_str}).to_list(50)
+    by_obj = []
+    try:
+        from bson import ObjectId
+        by_obj = await db.free_licence_agreements.find({"user_id": ObjectId(user_id_str)}).to_list(50)
+    except Exception:
+        pass
+    # Sample of latest 5 docs in collection (anonymised — only show user_id format)
+    sample = await db.free_licence_agreements.find({}).sort("agreed_at", -1).limit(5).to_list(5)
+
+    def safe(d):
+        out = {}
+        for k, v in (d or {}).items():
+            try:
+                if hasattr(v, "isoformat"):
+                    out[k] = v.isoformat()
+                else:
+                    out[k] = str(v)
+            except Exception:
+                out[k] = "?"
+        return out
+
+    return {
+        "current_user_id":      user_id_str,
+        "current_user_id_type": type(user["_id"]).__name__,
+        "total_docs_in_coll":   total,
+        "docs_matching_str":    len(by_str),
+        "docs_matching_obj":    len(by_obj),
+        "sample_recent_docs":   [safe(d) for d in sample],
+        "matching_str_sample":  [safe(d) for d in by_str[:3]],
+    }
+
+
 # ── Update beat details ───────────────────────────────────────────────────────
 
 @router.post("/beats/{beat_id}/update")
