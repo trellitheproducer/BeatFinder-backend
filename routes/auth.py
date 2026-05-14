@@ -13,6 +13,28 @@ from auth import hash_password, verify_password, create_token, get_current_user
 
 router = APIRouter()
 
+
+# ── Timestamp helper ─────────────────────────────────────────────────
+# All datetimes in MongoDB are stored naive-UTC (via datetime.utcnow()).
+# When we serialise them with .isoformat() the resulting string has NO
+# timezone marker — JavaScript's `new Date(...)` then parses it as LOCAL
+# time, which makes a post made 30 seconds ago look 1 hour old in BST
+# (or however far off the user's TZ is from UTC).
+# This helper appends "Z" so the client correctly treats it as UTC.
+def _iso_utc(dt) -> str:
+    """Serialise a naive-UTC datetime as an ISO-8601 string with Z suffix.
+    Accepts datetime, ISO string, or falsy → returns "" if nothing valid."""
+    if not dt:
+        return ""
+    if hasattr(dt, "isoformat"):
+        s = dt.isoformat()
+        return s if s.endswith("Z") or "+" in s else s + "Z"
+    s = str(dt)
+    if not s:
+        return ""
+    return s if s.endswith("Z") or "+" in s[10:] else s + "Z"
+
+
 PLANS = {
     "artist":   {"price_gbp": 4.99, "paypal_link": "https://www.paypal.com/paypalme/trellitheproducer/4.99GBP"},
     "producer": {"price_gbp": 8.99, "paypal_link": "https://www.paypal.com/paypalme/trellitheproducer/8.99GBP"},
@@ -961,7 +983,7 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
             items.append({
                 "kind":              "beat",
                 "id":                str(b["_id"]),
-                "created_at":        uploaded_at.isoformat() if uploaded_at else "",
+                "created_at":        _iso_utc(uploaded_at),
                 "_sort_ts":          uploaded_at.timestamp() if uploaded_at else 0,
                 # User
                 "username":          pinfo.get("username", b.get("producer_username", "")),
@@ -982,7 +1004,7 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                 "bpm":               b.get("bpm", 0),
                 "key":               b.get("key", ""),
                 "preview_start":     b.get("preview_start", 0),
-                "uploaded_at":       uploaded_at.isoformat() if uploaded_at else "",
+                "uploaded_at":       _iso_utc(uploaded_at),
                 "basic_lease_price":   b.get("basic_lease_price", 50 if b.get("price", "free") != "free" else 0),
                 "premium_lease_price": b.get("premium_lease_price", 0),
                 "premium_sold":        bool(b.get("premium_sold", False)),
@@ -1029,7 +1051,7 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                 items.append({
                     "kind":         "post",
                     "id":           str(p.get("_id")),
-                    "created_at":   created.isoformat() if hasattr(created, "isoformat") else (str(created) if created else ""),
+                    "created_at":   _iso_utc(created),
                     "_sort_ts":     created.timestamp() if hasattr(created, "timestamp") else 0,
                     # User
                     "username":     ainfo.get("username", p.get("username", "")),
