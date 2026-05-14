@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
-from mailer import (
+from routes.mailer import (
     send_email,
     contact_form_template,
     SUPPORT_EMAIL,
