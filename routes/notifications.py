@@ -1,6 +1,6 @@
 """
 Notifications routes: /api/notifications
-Real-time activity feed: likes, comments, purchases, messages.
+Real-time activity feed: likes, comments, purchases, messages, posts.
 """
 
 from fastapi import APIRouter, Request, Depends
@@ -15,12 +15,17 @@ router = APIRouter()
 def _notif_out(doc):
     return {
         "id":        str(doc.get("_id", "")),
-        "type":      doc.get("type", ""),       # like | comment | purchase | message
+        "type":      doc.get("type", ""),       # like | comment | purchase | message | post
         "fromUser":  doc.get("fromUser", ""),
         "text":      doc.get("text", ""),
         "read":      doc.get("read", False),
         "createdAt": doc.get("createdAt", datetime.utcnow()).isoformat()
                      if hasattr(doc.get("createdAt"), "isoformat") else str(doc.get("createdAt", "")),
+        # Post-type extras (set by follower_notify.py; harmless when absent
+        # — the frontend reads them only when type === "post").
+        "postId":    doc.get("postId", ""),
+        "postType":  doc.get("postType", ""),
+        "count":     doc.get("count", 1),
     }
 
 
