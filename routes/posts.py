@@ -24,8 +24,27 @@ def _id():
     return str(ObjectId())
 
 
-def _post_out(doc, liked=False):
-    return {
+def _iso_utc(dt) -> str:
+    """Append Z so JavaScript treats stored naive-UTC datetimes as UTC.
+    Same helper as routes/auth.py — duplicated here so this file stands
+    alone without cross-route imports."""
+    if not dt:
+        return ""
+    if hasattr(dt, "isoformat"):
+        s = dt.isoformat()
+        return s if s.endswith("Z") or "+" in s else s + "Z"
+    s = str(dt)
+    if not s:
+        return ""
+    return s if s.endswith("Z") or "+" in s[10:] else s + "Z"
+
+
+def _post_out(doc, liked=False, reposted=False, original_post=None):
+    """Serialise a post doc. If this doc is a repost (has repost_of set),
+    `original_post` should be the already-serialised dict of the original;
+    we attach it under "original_post" so the client can render the
+    original's content with the reposter's identity above it."""
+    out = {
         "id":           str(doc.get("_id", "")),
         "type":         doc.get("type", "status"),
         "text":         doc.get("text", ""),
@@ -41,10 +60,14 @@ def _post_out(doc, liked=False):
         "avatarUrl":    doc.get("avatarUrl", ""),
         "likeCount":    doc.get("likeCount", 0),
         "commentCount": doc.get("commentCount", 0),
+        "repostCount":  doc.get("repostCount", 0),
         "liked":        liked,
-        "createdAt":    doc.get("createdAt", datetime.utcnow()).isoformat()
-                        if hasattr(doc.get("createdAt"), "isoformat") else str(doc.get("createdAt", "")),
+        "reposted":     reposted,
+        "repost_of":    doc.get("repost_of"),
+        "original_post": original_post,
+        "createdAt":    _iso_utc(doc.get("createdAt", datetime.utcnow())),
     }
+    return out
 
 
 def _comment_out(doc):
@@ -55,8 +78,7 @@ def _comment_out(doc):
         "username":  doc.get("username", ""),
         "avatarUrl": doc.get("avatarUrl", ""),
         "text":      doc.get("text", ""),
-        "createdAt": doc.get("createdAt", datetime.utcnow()).isoformat()
-                     if hasattr(doc.get("createdAt"), "isoformat") else "",
+        "createdAt": _iso_utc(doc.get("createdAt", datetime.utcnow())),
     }
 
 
@@ -75,14 +97,39 @@ async def upload_to_cloudinary(file_bytes, filename, content_type, folder, publi
     return resp.json().get("secure_url", "")
 
 
+async def _hydrate_originals(db, docs: list) -> dict:
+    """For any docs that are reposts (have repost_of), fetch the original
+    post documents in a single batched query and return a map keyed by
+    original post id (string). Used so the client gets the original
+    content inline without an extra round-trip per repost."""
+    original_ids = [d.get("repost_of") for d in docs if d.get("repost_of")]
+    if not original_ids:
+        return {}
+    # Posts use string _ids (created via str(ObjectId()))
+    originals = await db.posts.find({"_id": {"$in": original_ids}}).to_list(len(original_ids))
+    return {str(o["_id"]): o for o in originals}
+
+
 @router.get("/profile/{username}")
 async def get_profile_posts(username: str, type: str = "status", request: Request = None):
-    db   = request.app.state.db
+    db = request.app.state.db
     query = {"username": username}
     if type != "all":
         query["type"] = type
     docs = await db.posts.find(query).sort("createdAt", -1).to_list(50)
-    return [_post_out(d) for d in docs]
+
+    # If any are reposts, pull the original docs so we can inline them
+    originals_map = await _hydrate_originals(db, docs)
+
+    out = []
+    for d in docs:
+        original_post = None
+        if d.get("repost_of"):
+            orig = originals_map.get(d["repost_of"])
+            if orig:
+                original_post = _post_out(orig)
+        out.append(_post_out(d, original_post=original_post))
+    return out
 
 
 @router.post("/status", status_code=201)
@@ -114,6 +161,7 @@ async def create_status(request: Request, user=Depends(get_current_user)):
         "avatarUrl":  user.get("avatarUrl", ""),
         "likeCount":  0,
         "commentCount": 0,
+        "repostCount": 0,
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
@@ -175,6 +223,7 @@ async def create_music_post(body: MusicPostBody, request: Request, user=Depends(
         "avatarUrl":  user.get("avatarUrl", ""),
         "likeCount":  0,
         "commentCount": 0,
+        "repostCount": 0,
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
@@ -224,6 +273,7 @@ async def create_video_post(request: Request, user=Depends(get_current_user)):
         "avatarUrl":  user.get("avatarUrl", ""),
         "likeCount":  0,
         "commentCount": 0,
+        "repostCount": 0,
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
@@ -235,9 +285,26 @@ async def create_video_post(request: Request, user=Depends(get_current_user)):
 @router.delete("/{post_id}")
 async def delete_post(post_id: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
+    # First find the post — needed so reposters can delete their own repost docs.
+    post = await db.posts.find_one({"_id": post_id, "username": user.get("username")})
+    if not post:
+        raise HTTPException(status_code=404, detail="Not found")
+
     result = await db.posts.delete_one({"_id": post_id, "username": user.get("username")})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
+
+    # If this was a repost, decrement the original post's repost count
+    if post.get("repost_of"):
+        await db.posts.update_one(
+            {"_id": post["repost_of"]},
+            {"$inc": {"repostCount": -1}}
+        )
+    else:
+        # Original post deleted — clean up associated reposts so they don't
+        # render as orphans pointing at a missing original.
+        await db.posts.delete_many({"repost_of": post_id})
+
     await db.post_comments.delete_many({"postId": post_id})
     await db.post_likes.delete_many({"postId": post_id})
     return {"deleted": True}
@@ -267,6 +334,102 @@ async def check_liked(post_id: str, request: Request, user=Depends(get_current_u
     db  = request.app.state.db
     hit = await db.post_likes.find_one({"postId": post_id, "username": user.get("username")})
     return {"liked": bool(hit)}
+
+
+# ── Repost ───────────────────────────────────────────────────────────────────
+# A repost is a thin post document with `repost_of: <original_post_id>` owned
+# by the reposting user. It carries no text/media of its own — the client
+# resolves the original via the `original_post` field populated by the
+# server. The original's `repostCount` counter is incremented on POST and
+# decremented on DELETE. We only allow one repost per user per post (toggle
+# semantics) and we never let users repost their own posts.
+@router.post("/{post_id}/repost", status_code=201)
+async def repost_post(post_id: str, request: Request, user=Depends(get_current_user)):
+    db       = request.app.state.db
+    username = user.get("username") or ""
+    if not username:
+        raise HTTPException(status_code=400, detail="Set a username before reposting")
+
+    original = await db.posts.find_one({"_id": post_id})
+    if not original:
+        raise HTTPException(status_code=404, detail="Original post not found")
+    # Can't repost your own post — defensive (frontend disables the button too)
+    if original.get("username") == username:
+        raise HTTPException(status_code=400, detail="You can't repost your own post")
+    # Can't repost a repost — always point at the underlying original. If the
+    # client somehow sent us a repost id, resolve to the real original.
+    underlying_id = original.get("repost_of") or post_id
+    if original.get("repost_of"):
+        original = await db.posts.find_one({"_id": underlying_id})
+        if not original:
+            raise HTTPException(status_code=404, detail="Original post not found")
+
+    # Already reposted? Toggle semantics — return the existing repost id.
+    existing = await db.posts.find_one({"username": username, "repost_of": underlying_id})
+    if existing:
+        return {"reposted": True, "id": str(existing["_id"]), "alreadyReposted": True}
+
+    doc = {
+        "_id":         _id(),
+        "type":        original.get("type", "status"),
+        "repost_of":   underlying_id,
+        "username":    username,
+        "avatarUrl":   user.get("avatarUrl", ""),
+        "createdAt":   datetime.utcnow(),
+        # Repost docs don't carry their own like/comment/repost counts —
+        # all engagement targets the underlying original. We still set the
+        # fields so listing queries don't choke on None.
+        "likeCount":   0,
+        "commentCount": 0,
+        "repostCount": 0,
+    }
+    await db.posts.insert_one(doc)
+    await db.posts.update_one({"_id": underlying_id}, {"$inc": {"repostCount": 1}})
+
+    # Notify the original poster
+    await create_notification(
+        db, original.get("username"), username, "repost",
+        f"@{username} reposted your post"
+    )
+    return {"reposted": True, "id": doc["_id"]}
+
+
+@router.delete("/{post_id}/repost")
+async def unrepost_post(post_id: str, request: Request, user=Depends(get_current_user)):
+    """Un-repost: removes the current user's repost of `post_id` (where
+    `post_id` is the underlying ORIGINAL post id). Decrements the original
+    post's repostCount. Idempotent — returns success even if there was
+    nothing to remove."""
+    db       = request.app.state.db
+    username = user.get("username") or ""
+    # `post_id` may be the original or (legacy) a repost id; normalise.
+    target = await db.posts.find_one({"_id": post_id})
+    underlying_id = post_id
+    if target and target.get("repost_of"):
+        underlying_id = target["repost_of"]
+
+    result = await db.posts.delete_one({"username": username, "repost_of": underlying_id})
+    if result.deleted_count:
+        await db.posts.update_one(
+            {"_id": underlying_id},
+            {"$inc": {"repostCount": -1}}
+        )
+    return {"reposted": False}
+
+
+@router.get("/{post_id}/reposted")
+async def check_reposted(post_id: str, request: Request, user=Depends(get_current_user)):
+    """Did the current user repost this post? Accepts either the original
+    post id or a repost id (the latter is normalised to its underlying
+    original first)."""
+    db       = request.app.state.db
+    username = user.get("username") or ""
+    target = await db.posts.find_one({"_id": post_id})
+    underlying_id = post_id
+    if target and target.get("repost_of"):
+        underlying_id = target["repost_of"]
+    hit = await db.posts.find_one({"username": username, "repost_of": underlying_id})
+    return {"reposted": bool(hit)}
 
 
 class CommentBody(BaseModel):
