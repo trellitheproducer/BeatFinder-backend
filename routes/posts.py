@@ -3,11 +3,13 @@ Posts routes: /api/posts
 """
 
 from fastapi import APIRouter, Request, Depends, HTTPException, UploadFile, File, Form
-from datetime import datetime
-from pydantic import BaseModel
+from datetime import datetime, timedelta
+from pydantic import BaseModel, HttpUrl
 from typing import Optional, List
 from bson import ObjectId
-import os, httpx, hashlib, time as _time
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+import os, httpx, hashlib, time as _time, html as _html_lib, re
 
 from auth import get_current_user
 from routes.notifications import create_notification
@@ -22,6 +24,163 @@ API_SECRET = os.getenv("CLOUDINARY_API_SECRET", "")
 
 def _id():
     return str(ObjectId())
+
+
+# ── Open Graph metadata parser ────────────────────────────────────────────────
+# Used for the in-post link previews. We pull og:title / og:description /
+# og:image / og:site_name from the <head>; falling back to <title> and the
+# first reasonable <meta name="description"> when the page doesn't expose
+# Open Graph tags. Anything beyond the <body> tag is ignored to keep this
+# fast on large pages.
+class _OGParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.og = {}                # raw og:* attribute map
+        self.title = ""
+        self.description = ""
+        self._in_title = False
+        self._stopped = False
+
+    def handle_starttag(self, tag, attrs):
+        if self._stopped:
+            return
+        if tag == "body":
+            # OG tags are always in <head>; bail out as soon as the body
+            # opens to keep parsing time bounded on huge pages.
+            self._stopped = True
+            return
+        if tag == "title":
+            self._in_title = True
+            return
+        if tag != "meta":
+            return
+        a = {k.lower(): (v or "") for k, v in attrs}
+        prop = a.get("property", "") or a.get("name", "")
+        prop = prop.lower()
+        content = a.get("content", "")
+        if not content:
+            return
+        if prop.startswith("og:"):
+            self.og[prop[3:]] = content
+        elif prop == "twitter:title" and not self.og.get("title"):
+            self.og["title"] = content
+        elif prop == "twitter:description" and not self.og.get("description"):
+            self.og["description"] = content
+        elif prop == "twitter:image" and not self.og.get("image"):
+            self.og["image"] = content
+        elif prop == "description" and not self.description:
+            self.description = content
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title and not self.title:
+            self.title = data.strip()
+
+
+def _absolute_url(base: str, maybe_relative: str) -> str:
+    if not maybe_relative:
+        return ""
+    try:
+        return urljoin(base, maybe_relative)
+    except Exception:
+        return maybe_relative
+
+
+def _short(s: str, n: int) -> str:
+    if not s:
+        return ""
+    s = _html_lib.unescape(s).strip()
+    return s[:n]
+
+
+async def _fetch_link_preview(url: str) -> dict:
+    """Fetch a URL and return a dict of OG metadata. Defensive — never
+    raises; returns {} on any failure. Caps the response body so a
+    malicious site can't OOM us by serving 500MB of HTML."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return {}
+        # Reject private / loopback hosts so users can't probe our internal
+        # network through the preview endpoint (SSRF). Crude but effective.
+        host = (parsed.hostname or "").lower()
+        if (host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+                or host.endswith(".local")
+                or host.startswith("10.")
+                or host.startswith("192.168.")
+                or host.startswith("169.254.")
+                or any(host.startswith(f"172.{i}.") for i in range(16, 32))):
+            return {}
+    except Exception:
+        return {}
+
+    headers = {
+        # Some sites (Twitter/X, LinkedIn) serve much richer OG metadata
+        # when they think they're being scraped by a real preview bot.
+        "User-Agent": "Mozilla/5.0 (compatible; BeatFinderBot/1.0; +https://beatfinder.co.uk)",
+        "Accept":     "text/html,application/xhtml+xml",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, max_redirects=4) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code != 200:
+                    return {}
+                # Only parse text/html responses; spare us downloading
+                # PDFs / images / videos that happen to be at the URL.
+                ct = (resp.headers.get("content-type") or "").lower()
+                if "html" not in ct:
+                    return {}
+                # Read up to ~512KB — enough for the <head> on any sane
+                # page, and a hard ceiling against runaway downloads.
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes(16 * 1024):
+                    buf.extend(chunk)
+                    if len(buf) >= 512 * 1024:
+                        break
+                # Detect charset from headers, fall back to utf-8
+                charset = "utf-8"
+                m = re.search(r"charset=([\w-]+)", ct)
+                if m:
+                    charset = m.group(1)
+                try:
+                    body = bytes(buf).decode(charset, errors="ignore")
+                except Exception:
+                    body = bytes(buf).decode("utf-8", errors="ignore")
+    except Exception:
+        return {}
+
+    p = _OGParser()
+    try:
+        p.feed(body)
+    except Exception:
+        pass
+
+    title       = p.og.get("title") or p.title or ""
+    description = p.og.get("description") or p.description or ""
+    image       = p.og.get("image") or ""
+    site_name   = p.og.get("site_name") or ""
+
+    # Resolve relative og:image URLs against the final URL
+    image = _absolute_url(url, image)
+
+    # Default siteName to the hostname when site doesn't provide one — gives
+    # the preview card something to show as the small uppercase header.
+    if not site_name:
+        try:
+            site_name = (urlparse(url).hostname or "").replace("www.", "")
+        except Exception:
+            site_name = ""
+
+    return {
+        "url":         url,
+        "title":       _short(title, 200),
+        "description": _short(description, 400),
+        "image":       image[:600] if image else "",
+        "siteName":    _short(site_name, 80),
+    }
 
 
 def _iso_utc(dt) -> str:
@@ -65,6 +224,14 @@ def _post_out(doc, liked=False, reposted=False, original_post=None):
         "reposted":     reposted,
         "repost_of":    doc.get("repost_of"),
         "original_post": original_post,
+        # Link preview fields — populated when /status is given a link_url.
+        # Stored on the post doc so the preview persists even if the
+        # remote site changes its OG tags or goes down later.
+        "linkUrl":         doc.get("linkUrl", ""),
+        "linkTitle":       doc.get("linkTitle", ""),
+        "linkDescription": doc.get("linkDescription", ""),
+        "linkImage":       doc.get("linkImage", ""),
+        "linkSiteName":    doc.get("linkSiteName", ""),
         "createdAt":    _iso_utc(doc.get("createdAt", datetime.utcnow())),
     }
     return out
@@ -140,6 +307,10 @@ async def create_status(request: Request, user=Depends(get_current_user)):
     form = await request.form()
     text   = str(form.get("text", "")).strip()[:500]
     files  = form.getlist("images")
+    # Optional URL the client extracted from the text. We re-validate and
+    # re-fetch on the server so a malicious client can't fabricate a fake
+    # preview with someone else's branding.
+    link_url = str(form.get("link_url", "")).strip()[:2048]
 
     if not text and not files:
         raise HTTPException(status_code=400, detail="Post needs text or an image")
@@ -152,6 +323,13 @@ async def create_status(request: Request, user=Depends(get_current_user)):
                                          "beatfinder/posts", public_id)
         image_urls.append(url)
 
+    # Fetch link preview metadata if a URL was supplied. We persist it on
+    # the post doc so the preview keeps rendering even if the remote
+    # changes their OG tags or the site goes down later.
+    link_meta = {}
+    if link_url:
+        link_meta = await _fetch_link_preview(link_url) or {}
+
     doc = {
         "_id":        _id(),
         "type":       "status",
@@ -162,6 +340,11 @@ async def create_status(request: Request, user=Depends(get_current_user)):
         "likeCount":  0,
         "commentCount": 0,
         "repostCount": 0,
+        "linkUrl":         link_meta.get("url", "") or (link_url if link_url else ""),
+        "linkTitle":       link_meta.get("title", ""),
+        "linkDescription": link_meta.get("description", ""),
+        "linkImage":       link_meta.get("image", ""),
+        "linkSiteName":    link_meta.get("siteName", ""),
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
@@ -172,6 +355,23 @@ async def create_status(request: Request, user=Depends(get_current_user)):
         "image" if image_urls else "status",
     )
     return _post_out(doc)
+
+
+# ── Live link preview (used by the composer to show a preview as the user types) ──
+class LinkPreviewBody(BaseModel):
+    url: str
+
+@router.post("/link-preview")
+async def link_preview(body: LinkPreviewBody, user=Depends(get_current_user)):
+    """Fetch and return Open Graph metadata for an arbitrary URL. Auth-only
+    so anonymous traffic can't use us as a free SSRF proxy. Returns the
+    same shape as the linkXxx fields persisted on /status posts."""
+    url = (body.url or "").strip()
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return {}
+    if len(url) > 2048:
+        return {}
+    return await _fetch_link_preview(url) or {}
 
 
 class MusicPostBody(BaseModel):
