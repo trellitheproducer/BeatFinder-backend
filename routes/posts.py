@@ -11,6 +11,7 @@ import os, httpx, hashlib, time as _time
 
 from auth import get_current_user
 from routes.notifications import create_notification
+from routes.follower_notify import notify_post_to_followers
 
 router = APIRouter()
 
@@ -116,6 +117,12 @@ async def create_status(request: Request, user=Depends(get_current_user)):
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
+    # Notify followers — bundled "@user posted an update" / "@user posted N updates"
+    # If images attached, treat as image post (more interesting at-a-glance).
+    await notify_post_to_followers(
+        request.app.state.db, user, doc["_id"],
+        "image" if image_urls else "status",
+    )
     return _post_out(doc)
 
 
@@ -171,6 +178,8 @@ async def create_music_post(body: MusicPostBody, request: Request, user=Depends(
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
+    # Notify followers — bundled "@user shared a new track"
+    await notify_post_to_followers(request.app.state.db, user, doc["_id"], "music")
     return _post_out(doc)
 
 
@@ -218,6 +227,8 @@ async def create_video_post(request: Request, user=Depends(get_current_user)):
         "createdAt":  datetime.utcnow(),
     }
     await request.app.state.db.posts.insert_one(doc)
+    # Notify followers — bundled "@user posted a new video"
+    await notify_post_to_followers(request.app.state.db, user, doc["_id"], "video")
     return _post_out(doc)
 
 
