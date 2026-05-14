@@ -156,19 +156,49 @@ async def accept_terms(body: AcceptTermsRequest, request: Request, user=Depends(
     if not body.version or not isinstance(body.version, str) or len(body.version) > 32:
         raise HTTPException(status_code=400, detail="Invalid version")
     db = request.app.state.db
+    # Capture client IP + user agent for the audit trail. These give us
+    # defensible evidence of who accepted the Terms, from where, and when
+    # — useful if a user later disputes consent or under GDPR challenges.
+    client_ip = ""
+    try:
+        # Trust X-Forwarded-For from Render's reverse proxy
+        fwd = request.headers.get("x-forwarded-for", "")
+        client_ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
+    except Exception:
+        client_ip = ""
+    user_agent = request.headers.get("user-agent", "")[:512]
+    now = datetime.utcnow()
     await db.users.update_one(
         {"_id": user["_id"]},
         {
             "$set": {
-                "terms_accepted_version": body.version,
-                "terms_accepted_at":      datetime.utcnow(),
+                "terms_accepted_version":    body.version,
+                "terms_accepted_at":         now,
+                "terms_accepted_ip":         client_ip,
+                "terms_accepted_user_agent": user_agent,
             }
         },
     )
+    # Also append to a permanent acceptance history collection so we keep
+    # every acceptance event forever, even if the user later accepts a
+    # newer version (which would otherwise overwrite the user document).
+    try:
+        await db.terms_acceptances.insert_one({
+            "user_id":    user["_id"],
+            "username":   user.get("username", ""),
+            "email":      user.get("email", ""),
+            "version":    body.version,
+            "accepted_at": now,
+            "ip":         client_ip,
+            "user_agent": user_agent,
+        })
+    except Exception:
+        # Non-fatal — main update succeeded
+        pass
     return {
         "success": True,
         "version": body.version,
-        "accepted_at": datetime.utcnow().isoformat(),
+        "accepted_at": now.isoformat(),
     }
 
 
