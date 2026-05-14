@@ -415,11 +415,16 @@ def _iso_utc(dt) -> str:
     return s if s.endswith("Z") or "+" in s[10:] else s + "Z"
 
 
-def _post_out(doc, liked=False, reposted=False, original_post=None):
+def _post_out(doc, liked=False, reposted=False, original_post=None, author_plan=""):
     """Serialise a post doc. If this doc is a repost (has repost_of set),
     `original_post` should be the already-serialised dict of the original;
     we attach it under "original_post" so the client can render the
-    original's content with the reposter's identity above it."""
+    original's content with the reposter's identity above it.
+
+    `author_plan` is the author's current plan ("artist" | "producer" |
+    "free"); used by the frontend to decide whether to show the
+    verified tick next to their name. Optional — defaults to empty
+    string (frontend then treats them as non-verified)."""
     out = {
         "id":           str(doc.get("_id", "")),
         "type":         doc.get("type", "status"),
@@ -434,6 +439,9 @@ def _post_out(doc, liked=False, reposted=False, original_post=None):
         "caption":      doc.get("caption", ""),
         "username":     doc.get("username", ""),
         "avatarUrl":    doc.get("avatarUrl", ""),
+        # Author's plan — frontend reads this to decide whether to
+        # render the verified tick next to the username.
+        "plan":         author_plan or "",
         "likeCount":    doc.get("likeCount", 0),
         "commentCount": doc.get("commentCount", 0),
         "repostCount":  doc.get("repostCount", 0),
@@ -505,14 +513,42 @@ async def get_profile_posts(username: str, type: str = "status", request: Reques
     # If any are reposts, pull the original docs so we can inline them
     originals_map = await _hydrate_originals(db, docs)
 
+    # Bulk-fetch plans for every author appearing in this result set —
+    # both the profile owner (wrappers) AND any reposted-author usernames
+    # (originals can be by other users). One query, then we look up by
+    # username when serialising each post.
+    usernames_set = set()
+    for d in docs:
+        if d.get("username"):
+            usernames_set.add(d["username"])
+    for o in originals_map.values():
+        if o.get("username"):
+            usernames_set.add(o["username"])
+    plan_by_username = {}
+    if usernames_set:
+        plan_docs = await db.users.find(
+            {"username": {"$in": list(usernames_set)}},
+            {"username": 1, "plan": 1},
+        ).to_list(length=len(usernames_set) + 10)
+        for u in plan_docs:
+            if u.get("username"):
+                plan_by_username[u["username"]] = u.get("plan", "")
+
     out = []
     for d in docs:
         original_post = None
         if d.get("repost_of"):
             orig = originals_map.get(d["repost_of"])
             if orig:
-                original_post = _post_out(orig)
-        out.append(_post_out(d, original_post=original_post))
+                original_post = _post_out(
+                    orig,
+                    author_plan=plan_by_username.get(orig.get("username", ""), ""),
+                )
+        out.append(_post_out(
+            d,
+            original_post=original_post,
+            author_plan=plan_by_username.get(d.get("username", ""), ""),
+        ))
     return out
 
 
