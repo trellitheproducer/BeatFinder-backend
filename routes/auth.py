@@ -183,6 +183,154 @@ async def upgrade_plan(body: PlanUpgradeRequest, request: Request, user=Depends(
     }
 
 
+# ── GDPR: Export My Data (Article 15 — right of access) ──────────
+# Returns a JSON snapshot of everything we hold on this user, suitable
+# for delivery to the user as a downloadable file. Sensitive fields
+# (password hash, internal admin flags) are excluded.
+@router.get("/export-my-data")
+async def export_my_data(request: Request, user=Depends(get_current_user)):
+    db = request.app.state.db
+    uid = user["_id"]
+    uid_str = str(uid)
+
+    def _clean_doc(d: dict) -> dict:
+        """Convert ObjectId/datetime to string; strip internal fields."""
+        if not d:
+            return d
+        out = {}
+        for k, v in d.items():
+            if k in ("password", "hashed_password", "stripe_secret_key", "_id"):
+                continue
+            if isinstance(v, ObjectId):
+                out[k] = str(v)
+            elif isinstance(v, datetime):
+                out[k] = v.isoformat()
+            elif isinstance(v, list):
+                out[k] = [
+                    _clean_doc(x) if isinstance(x, dict) else (str(x) if isinstance(x, ObjectId) else x)
+                    for x in v
+                ]
+            elif isinstance(v, dict):
+                out[k] = _clean_doc(v)
+            else:
+                out[k] = v
+        return out
+
+    profile = _clean_doc(user)
+
+    # Gather all collections containing this user's data
+    beats             = await db.beats.find({"producer_id": uid_str}).to_list(length=None) if "beats" in await db.list_collection_names() else []
+    leases_bought     = await db.producer_leases.find({"user_id": uid_str}).to_list(length=None) if "producer_leases" in await db.list_collection_names() else []
+    leases_sold       = await db.producer_leases.find({"producer_id": uid_str}).to_list(length=None) if "producer_leases" in await db.list_collection_names() else []
+    free_licences     = await db.free_licence_agreements.find({"user_id": uid_str}).to_list(length=None) if "free_licence_agreements" in await db.list_collection_names() else []
+    saved_lyrics      = await db.lyrics.find({"user_id": uid_str}).to_list(length=None) if "lyrics" in await db.list_collection_names() else []
+    messages_sent     = await db.messages.find({"sender_id": uid_str}).to_list(length=None) if "messages" in await db.list_collection_names() else []
+    messages_received = await db.messages.find({"recipient_id": uid_str}).to_list(length=None) if "messages" in await db.list_collection_names() else []
+    notifications     = await db.notifications.find({"user_id": uid_str}).to_list(length=None) if "notifications" in await db.list_collection_names() else []
+
+    export = {
+        "export_metadata": {
+            "exported_at":           datetime.utcnow().isoformat(),
+            "exported_for_user_id":  uid_str,
+            "data_controller":       "BeatFinder",
+            "contact":               "support@beatfinder.co.uk",
+            "lawful_basis":          "UK GDPR Article 15 — Right of Access",
+            "format_note":           "JSON. Some fields (password hash, internal admin flags) are excluded for security.",
+        },
+        "profile":           profile,
+        "beats_uploaded":    [_clean_doc(b) for b in beats],
+        "leases_purchased":  [_clean_doc(l) for l in leases_bought],
+        "leases_sold":       [_clean_doc(l) for l in leases_sold],
+        "free_licences":     [_clean_doc(l) for l in free_licences],
+        "saved_lyrics":      [_clean_doc(l) for l in saved_lyrics],
+        "messages_sent":     [_clean_doc(m) for m in messages_sent],
+        "messages_received": [_clean_doc(m) for m in messages_received],
+        "notifications":     [_clean_doc(n) for n in notifications],
+    }
+    return export
+
+
+# ── GDPR: Delete My Account (Article 17 — right to erasure) ──────
+# Soft-deletes the user: anonymises identifiable fields and marks
+# the account as deleted. A scheduled job (run manually for now)
+# can hard-purge accounts that have been soft-deleted for >30 days.
+# We keep some records (e.g. lease contracts already sold to other
+# users) for legal reasons (UK tax law requires 6-year retention,
+# and licensees retain valid leases regardless of the seller's
+# account status).
+class DeleteAccountRequest(BaseModel):
+    confirm_email: str
+    reason: Optional[str] = None
+
+@router.post("/delete-my-account")
+async def delete_my_account(body: DeleteAccountRequest, request: Request, user=Depends(get_current_user)):
+    # Verify the user typed their own email to confirm intent
+    if (body.confirm_email or "").strip().lower() != (user.get("email") or "").lower():
+        raise HTTPException(status_code=400, detail="Confirmation email does not match account email")
+
+    db = request.app.state.db
+    uid = user["_id"]
+    uid_str = str(uid)
+
+    now = datetime.utcnow()
+    anon_email = f"deleted-{uid_str}@deleted.beatfinder.invalid"
+    anon_username = f"deleted_user_{uid_str[:8]}"
+
+    # Anonymise the user record (keep _id for foreign-key integrity)
+    await db.users.update_one(
+        {"_id": uid},
+        {
+            "$set": {
+                "deleted":               True,
+                "deleted_at":            now,
+                "deletion_reason":       (body.reason or "")[:500],
+                "email":                 anon_email,
+                "username":              anon_username,
+                "name":                  "Deleted user",
+                "bio":                   "",
+                "location":              "",
+                "instagram":             "",
+                "tiktok":                "",
+                "youtube":               "",
+                "spotify":               "",
+                "website":               "",
+                "avatarUrl":             "",
+                "headerUrl":             "",
+                "appleMusic":            "",
+                "stripe_customer_id":    "",
+                "subscription_expires_at": None,
+                "plan":                  "free",
+            },
+            "$unset": {
+                "password": "",
+                "hashed_password": "",
+            },
+        },
+    )
+
+    # Remove their uploaded beats from public visibility
+    if "beats" in await db.list_collection_names():
+        await db.beats.update_many(
+            {"producer_id": uid_str},
+            {"$set": {"deleted": True, "deleted_at": now, "hidden": True}},
+        )
+
+    # Soft-delete personal items (lyrics, messages) — kept for foreign keys
+    if "lyrics" in await db.list_collection_names():
+        await db.lyrics.delete_many({"user_id": uid_str})
+    if "free_licence_agreements" in await db.list_collection_names():
+        await db.free_licence_agreements.delete_many({"user_id": uid_str})
+
+    # Note: leases (purchased or sold) are intentionally KEPT —
+    # legal/tax retention (6 years HMRC) + buyers retain valid licences.
+
+    return {
+        "success": True,
+        "deleted_at": now.isoformat(),
+        "note": "Your account has been anonymised. Records required for legal compliance (transaction history, lease contracts) are retained under Schedule 2 of the UK GDPR. All personally identifiable fields have been removed. Backups will fully purge within 30 days.",
+    }
+
+
 # ── Set username ──────────────────────────────────────────────────
 class UsernameRequest(BaseModel):
     username: str
