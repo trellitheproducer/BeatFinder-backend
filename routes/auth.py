@@ -698,6 +698,16 @@ async def follow_user(username: str, request: Request, user=Depends(get_current_
     if follower_id == following_id:
         raise HTTPException(status_code=400, detail="Cannot follow yourself")
 
+    # If either user has blocked the other, follow is not allowed
+    db_blocks = await db.blocks.find_one({
+        "$or": [
+            {"blocker_id": follower_id,  "blocked_id": following_id},
+            {"blocker_id": following_id, "blocked_id": follower_id},
+        ]
+    })
+    if db_blocks:
+        raise HTTPException(status_code=403, detail="Unable to follow this user")
+
     await db.follows.update_one(
         {"follower_id": follower_id, "following_id": following_id},
         {"$setOnInsert": {
@@ -724,6 +734,115 @@ async def unfollow_user(username: str, request: Request, user=Depends(get_curren
     return {"success": True, "following": False}
 
 
+# ── Block / unblock ───────────────────────────────────────────────
+# Blocking is stricter than unfollowing:
+#   - The blocked user can no longer see the blocker's profile, posts, beats
+#     (filtered server-side wherever feasible) or send them messages
+#   - Both directions of any existing follow relationship are removed
+#   - The blocked user is NOT notified
+# Blocks live in their own `blocks` collection with the same key pattern as
+# follows: blocker_id, blocked_id, created_at.
+@router.post("/block/{username}")
+async def block_user(username: str, request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    blocker_id = str(user["_id"])
+    blocked_id = str(target["_id"])
+
+    if blocker_id == blocked_id:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+
+    # Upsert the block record
+    await db.blocks.update_one(
+        {"blocker_id": blocker_id, "blocked_id": blocked_id},
+        {"$setOnInsert": {
+            "blocker_id": blocker_id,
+            "blocked_id": blocked_id,
+            "created_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+
+    # Sever follows in BOTH directions so blocked accounts don't keep
+    # showing up in feeds / followers / following counts
+    await db.follows.delete_one({"follower_id":  blocker_id, "following_id": blocked_id})
+    await db.follows.delete_one({"follower_id":  blocked_id, "following_id": blocker_id})
+
+    return {"success": True, "blocked": True}
+
+
+@router.delete("/block/{username}")
+async def unblock_user(username: str, request: Request, user=Depends(get_current_user)):
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.blocks.delete_one({
+        "blocker_id": str(user["_id"]),
+        "blocked_id": str(target["_id"]),
+    })
+    return {"success": True, "blocked": False}
+
+
+@router.get("/blocked-users")
+async def list_blocked_users(request: Request, user=Depends(get_current_user)):
+    """List all users the current user has blocked — used by the Settings
+    'Blocked Users' panel so they can unblock people."""
+    db = request.app.state.db
+    block_docs = await db.blocks.find({"blocker_id": str(user["_id"])}).to_list(500)
+    blocked_ids = [b["blocked_id"] for b in block_docs]
+    if not blocked_ids:
+        return []
+    from bson import ObjectId as _ObjId
+    valid_ids = []
+    for bid in blocked_ids:
+        try: valid_ids.append(_ObjId(bid))
+        except Exception: pass
+    if not valid_ids:
+        return []
+    users = await db.users.find(
+        {"_id": {"$in": valid_ids}},
+        {"username": 1, "name": 1, "avatarUrl": 1, "plan": 1}
+    ).to_list(500)
+    return [
+        {
+            "username":  u.get("username", ""),
+            "name":      u.get("name", ""),
+            "avatarUrl": u.get("avatarUrl", ""),
+            "plan":      u.get("plan", "free"),
+        }
+        for u in users
+    ]
+
+
+@router.get("/block-status/{username}")
+async def block_status(username: str, request: Request, user=Depends(get_current_user)):
+    """Return whether the current user has blocked `username`, AND whether
+    `username` has blocked the current user. The frontend uses this to:
+      - Show 'Block / Unblock' button state on profiles
+      - Show 'This user has blocked you' empty state if reverse-blocked
+    """
+    db     = request.app.state.db
+    target = await db.users.find_one({"username": username})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    me_id  = str(user["_id"])
+    them_id = str(target["_id"])
+
+    i_blocked_them = await db.blocks.find_one({"blocker_id": me_id, "blocked_id": them_id})
+    they_blocked_me = await db.blocks.find_one({"blocker_id": them_id, "blocked_id": me_id})
+
+    return {
+        "i_blocked_them":  bool(i_blocked_them),
+        "they_blocked_me": bool(they_blocked_me),
+    }
+
+
 # ── Activity feed: new uploads + posts from followed users ─────
 # Returns a merged, time-sorted stream of activity from people the user
 # follows. Two kinds of items:
@@ -741,6 +860,21 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
     # Get list of user IDs the current user follows
     follow_docs = await db.follows.find({"follower_id": user_id}).to_list(500)
     following_ids = [f["following_id"] for f in follow_docs]
+    if not following_ids:
+        return []
+
+    # Exclude anyone the user has blocked OR who has blocked the user.
+    # The block endpoint already unfollows in both directions, but we filter
+    # again here defensively in case of stale data.
+    block_docs = await db.blocks.find({
+        "$or": [{"blocker_id": user_id}, {"blocked_id": user_id}]
+    }).to_list(1000)
+    blocked_set = set()
+    for b in block_docs:
+        blocked_set.add(b.get("blocker_id"))
+        blocked_set.add(b.get("blocked_id"))
+    blocked_set.discard(user_id)
+    following_ids = [fid for fid in following_ids if fid not in blocked_set]
     if not following_ids:
         return []
 
