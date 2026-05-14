@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 import os, httpx, hashlib, time as _time, html as _html_lib, re
 
-from auth import get_current_user
+from auth import get_current_user, get_admin_user
 from routes.notifications import create_notification
 from routes.follower_notify import notify_post_to_followers
 
@@ -38,6 +38,11 @@ class _OGParser(HTMLParser):
         self.og = {}                # raw og:* attribute map
         self.title = ""
         self.description = ""
+        # Fallback images discovered in the <head> — used when the page
+        # has no og:image. Order matters; first non-empty wins.
+        self.image_src   = ""       # <link rel="image_src" href="...">
+        self.apple_icon  = ""       # <link rel="apple-touch-icon" href="...">
+        self.icon        = ""       # <link rel="icon" href="...">
         self._in_title = False
         self._stopped = False
 
@@ -51,6 +56,19 @@ class _OGParser(HTMLParser):
             return
         if tag == "title":
             self._in_title = True
+            return
+        if tag == "link":
+            a = {k.lower(): (v or "") for k, v in attrs}
+            rel  = (a.get("rel", "") or "").lower()
+            href = a.get("href", "")
+            if not href:
+                return
+            if "image_src" in rel and not self.image_src:
+                self.image_src = href
+            elif "apple-touch-icon" in rel and not self.apple_icon:
+                self.apple_icon = href
+            elif rel == "icon" and not self.icon:
+                self.icon = href
             return
         if tag != "meta":
             return
@@ -66,10 +84,13 @@ class _OGParser(HTMLParser):
             self.og["title"] = content
         elif prop == "twitter:description" and not self.og.get("description"):
             self.og["description"] = content
-        elif prop == "twitter:image" and not self.og.get("image"):
+        elif prop in ("twitter:image", "twitter:image:src") and not self.og.get("image"):
             self.og["image"] = content
         elif prop == "description" and not self.description:
             self.description = content
+        elif prop == "thumbnail" and not self.og.get("image"):
+            # Some YouTube-adjacent pages use <meta name="thumbnail">
+            self.og["image"] = content
 
     def handle_endtag(self, tag):
         if tag == "title":
@@ -96,10 +117,95 @@ def _short(s: str, n: int) -> str:
     return s[:n]
 
 
+# ── YouTube helpers ───────────────────────────────────────────────────────────
+# YouTube's short links (youtu.be/{id}) serve a sparse page without proper
+# Open Graph tags, so we normalize to the long form before fetching. We also
+# keep the extracted video ID around so we can fall back to img.youtube.com
+# for the thumbnail if the fetched page somehow lacks og:image.
+_YOUTUBE_HOSTS = (
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "youtu.be", "music.youtube.com",
+)
+
+def _youtube_video_id(url: str) -> str:
+    """Return the YouTube video id if this URL points to a YouTube video,
+    else empty string. Handles: youtu.be/{id}, youtube.com/watch?v={id},
+    youtube.com/shorts/{id}, youtube.com/embed/{id}."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return ""
+    host = (u.hostname or "").lower()
+    if host not in _YOUTUBE_HOSTS:
+        return ""
+    # youtu.be/{id}
+    if host == "youtu.be":
+        seg = u.path.lstrip("/").split("/", 1)[0]
+        return seg if re.match(r"^[A-Za-z0-9_-]{6,20}$", seg) else ""
+    # youtube.com/watch?v={id}
+    if u.path == "/watch":
+        from urllib.parse import parse_qs
+        q = parse_qs(u.query)
+        vid = (q.get("v") or [""])[0]
+        return vid if re.match(r"^[A-Za-z0-9_-]{6,20}$", vid) else ""
+    # /shorts/{id} or /embed/{id} or /v/{id}
+    m = re.match(r"^/(?:shorts|embed|v)/([A-Za-z0-9_-]{6,20})", u.path)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _youtube_thumbnail(video_id: str) -> str:
+    """Return the highest-quality YouTube thumbnail URL for a video id.
+    `maxresdefault.jpg` is available for almost every video that's had any
+    significant view count; for newer/obscure videos we'd want hqdefault
+    as a fallback but most clients silently fall back already."""
+    if not video_id:
+        return ""
+    return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+
+def _normalize_url(url: str) -> str:
+    """Rewrite known short-form URLs to a form that serves richer OG tags.
+    Currently: youtu.be/{id} → youtube.com/watch?v={id}."""
+    try:
+        u = urlparse(url)
+    except Exception:
+        return url
+    host = (u.hostname or "").lower()
+    if host == "youtu.be":
+        vid = u.path.lstrip("/").split("/", 1)[0]
+        if re.match(r"^[A-Za-z0-9_-]{6,20}$", vid):
+            return f"https://www.youtube.com/watch?v={vid}"
+    return url
+
+
+# Regex used to scrape URLs out of post text bodies (both the live /status
+# endpoint and the admin backfill). Matches http/https URLs, stops at
+# whitespace and common trailing punctuation.
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+
+
+def _extract_first_url(text: str) -> str:
+    if not text:
+        return ""
+    m = _URL_RE.search(text)
+    if not m:
+        return ""
+    return m.group(0).rstrip(".,;!?)")
+
+
 async def _fetch_link_preview(url: str) -> dict:
     """Fetch a URL and return a dict of OG metadata. Defensive — never
     raises; returns {} on any failure. Caps the response body so a
     malicious site can't OOM us by serving 500MB of HTML."""
+    # Capture the original URL before normalization so the stored linkUrl
+    # still points where the user actually typed (clicking the preview
+    # should send them to the URL they pasted, not our rewritten one).
+    original_url = url
+    url = _normalize_url(url)
+    yt_id = _youtube_video_id(url)
+
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -123,59 +229,77 @@ async def _fetch_link_preview(url: str) -> dict:
         "User-Agent": "Mozilla/5.0 (compatible; BeatFinderBot/1.0; +https://beatfinder.co.uk)",
         "Accept":     "text/html,application/xhtml+xml",
     }
+    body = ""
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, max_redirects=4) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 if resp.status_code != 200:
-                    return {}
-                # Only parse text/html responses; spare us downloading
-                # PDFs / images / videos that happen to be at the URL.
-                ct = (resp.headers.get("content-type") or "").lower()
-                if "html" not in ct:
-                    return {}
-                # Read up to ~512KB — enough for the <head> on any sane
-                # page, and a hard ceiling against runaway downloads.
-                buf = bytearray()
-                async for chunk in resp.aiter_bytes(16 * 1024):
-                    buf.extend(chunk)
-                    if len(buf) >= 512 * 1024:
-                        break
-                # Detect charset from headers, fall back to utf-8
-                charset = "utf-8"
-                m = re.search(r"charset=([\w-]+)", ct)
-                if m:
-                    charset = m.group(1)
-                try:
-                    body = bytes(buf).decode(charset, errors="ignore")
-                except Exception:
-                    body = bytes(buf).decode("utf-8", errors="ignore")
+                    body = ""
+                else:
+                    # Only parse text/html responses; spare us downloading
+                    # PDFs / images / videos that happen to be at the URL.
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if "html" in ct:
+                        # Read up to ~512KB — enough for the <head> on any sane
+                        # page, and a hard ceiling against runaway downloads.
+                        buf = bytearray()
+                        async for chunk in resp.aiter_bytes(16 * 1024):
+                            buf.extend(chunk)
+                            if len(buf) >= 512 * 1024:
+                                break
+                        # Detect charset from headers, fall back to utf-8
+                        charset = "utf-8"
+                        m = re.search(r"charset=([\w-]+)", ct)
+                        if m:
+                            charset = m.group(1)
+                        try:
+                            body = bytes(buf).decode(charset, errors="ignore")
+                        except Exception:
+                            body = bytes(buf).decode("utf-8", errors="ignore")
     except Exception:
-        return {}
+        body = ""
 
     p = _OGParser()
-    try:
-        p.feed(body)
-    except Exception:
-        pass
+    if body:
+        try:
+            p.feed(body)
+        except Exception:
+            pass
 
     title       = p.og.get("title") or p.title or ""
     description = p.og.get("description") or p.description or ""
     image       = p.og.get("image") or ""
     site_name   = p.og.get("site_name") or ""
 
+    # Fallback chain for the image — og:image → twitter:image (already in
+    # p.og.image via the parser) → <link rel="image_src"> → apple-touch-icon
+    # → favicon. We resolve relative URLs against the page URL.
+    if not image:
+        image = p.image_src or p.apple_icon or p.icon or ""
+
     # Resolve relative og:image URLs against the final URL
     image = _absolute_url(url, image)
+
+    # YouTube safety net: if we have a video id and no usable image came
+    # back from the page, build the thumbnail URL directly. Same for if we
+    # somehow got nothing from the page at all (network error, etc).
+    if yt_id and (not image or "youtube.com" not in image and "ytimg" not in image and "youtu.be" not in image):
+        image = _youtube_thumbnail(yt_id)
+    if yt_id and not title:
+        title = "YouTube"  # at least something visible
 
     # Default siteName to the hostname when site doesn't provide one — gives
     # the preview card something to show as the small uppercase header.
     if not site_name:
         try:
-            site_name = (urlparse(url).hostname or "").replace("www.", "")
+            site_name = (urlparse(original_url).hostname or "").replace("www.", "")
         except Exception:
             site_name = ""
 
     return {
-        "url":         url,
+        # Return the ORIGINAL url the user typed; the rewrite was just so
+        # we'd get richer metadata back from the host.
+        "url":         original_url,
         "title":       _short(title, 200),
         "description": _short(description, 400),
         "image":       image[:600] if image else "",
@@ -311,6 +435,12 @@ async def create_status(request: Request, user=Depends(get_current_user)):
     # re-fetch on the server so a malicious client can't fabricate a fake
     # preview with someone else's branding.
     link_url = str(form.get("link_url", "")).strip()[:2048]
+    # If the client didn't pre-extract a URL but one is sitting in the
+    # text body, pick it up server-side so EVERY post with a link gets
+    # a preview — even if the post was created via a client that didn't
+    # implement URL detection.
+    if not link_url and text:
+        link_url = _extract_first_url(text)[:2048]
 
     if not text and not files:
         raise HTTPException(status_code=400, detail="Post needs text or an image")
@@ -372,6 +502,115 @@ async def link_preview(body: LinkPreviewBody, user=Depends(get_current_user)):
     if len(url) > 2048:
         return {}
     return await _fetch_link_preview(url) or {}
+
+
+@router.post("/admin/backfill-link-previews")
+async def backfill_link_previews(
+    request: Request,
+    limit: int = 500,
+    force: bool = False,
+    user=Depends(get_admin_user),
+):
+    """Admin endpoint — re-fetch link preview metadata for posts.
+
+    Behavior:
+      • Walks the posts collection looking for status posts whose text
+        contains a URL or whose linkUrl field is set.
+      • For each one, fetches the URL's OG metadata and writes the five
+        linkXxx fields back onto the post doc.
+      • Skips posts that already have a linkImage set unless ?force=true
+        is passed. This makes the endpoint idempotent: you can run it
+        repeatedly and it only touches posts that still need it.
+      • Caps processing at `limit` posts per call so a single request
+        can't run for hours. Default 500 is plenty for any small/medium
+        deployment. Hit it multiple times if you have more than that.
+
+    Returns:
+      {
+        scanned: int,     # how many candidate posts we looked at
+        fetched: int,     # how many we actually re-fetched (network)
+        updated: int,     # how many got new metadata written
+        skipped: int,     # how many were skipped (already had image)
+        failed:  int,     # fetches that returned nothing usable
+      }
+    """
+    db = request.app.state.db
+    # Candidate query: any post that has a linkUrl already, OR has a URL
+    # somewhere in its text body. We can't do regex on text in a portable
+    # way without a Mongo regex op, so we pull text posts and filter in
+    # Python — cheap enough for the volumes we're at.
+    cursor = db.posts.find({
+        "$or": [
+            {"linkUrl": {"$exists": True, "$ne": ""}},
+            {"text":    {"$regex": r"https?://", "$options": "i"}},
+        ],
+    }).limit(max(1, min(int(limit), 2000)))
+
+    scanned = 0
+    fetched = 0
+    updated = 0
+    skipped = 0
+    failed  = 0
+
+    async for post in cursor:
+        scanned += 1
+        # Decide which URL to fetch for this post: prefer stored linkUrl,
+        # else extract the first URL from the text.
+        url = (post.get("linkUrl") or "").strip()
+        if not url:
+            url = _extract_first_url(post.get("text", ""))
+        if not url:
+            skipped += 1
+            continue
+        # Idempotency: if we already have a thumbnail and the caller
+        # didn't pass force=true, leave it alone.
+        if not force and post.get("linkImage"):
+            skipped += 1
+            continue
+
+        fetched += 1
+        meta = await _fetch_link_preview(url) or {}
+        # Even on total failure the parser tries to give us a hostname
+        # for siteName, so check whether we actually have something
+        # better than what's already on the doc before writing.
+        new_image       = meta.get("image", "")
+        new_title       = meta.get("title", "")
+        new_description = meta.get("description", "")
+        new_site_name   = meta.get("siteName", "")
+        # If we still have no image at all, count it as failed but
+        # still update the title/description/siteName so the placeholder
+        # at least has a hostname strip on it.
+        if not new_image and not new_title and not new_description:
+            failed += 1
+            # Still set linkUrl + siteName so the placeholder renders
+            await db.posts.update_one(
+                {"_id": post["_id"]},
+                {"$set": {
+                    "linkUrl":      url,
+                    "linkSiteName": new_site_name,
+                }},
+            )
+            continue
+
+        await db.posts.update_one(
+            {"_id": post["_id"]},
+            {"$set": {
+                "linkUrl":         url,
+                "linkTitle":       new_title,
+                "linkDescription": new_description,
+                "linkImage":       new_image,
+                "linkSiteName":    new_site_name,
+            }},
+        )
+        updated += 1
+
+    return {
+        "scanned": scanned,
+        "fetched": fetched,
+        "updated": updated,
+        "skipped": skipped,
+        "failed":  failed,
+    }
 
 
 class MusicPostBody(BaseModel):
