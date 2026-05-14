@@ -22,6 +22,7 @@ from routes.posts    import router as posts_router
 from routes.ai import router as ai_router
 from routes.notifications import router as notifications_router
 from routes.contracts import router as contracts_router
+from routes.bpm import router as bpm_router
 
 load_dotenv()
 
@@ -46,6 +47,8 @@ async def lifespan(app: FastAPI):
     await app.state.db.post_comments.create_index([("postId", 1), ("createdAt", 1)])
     await app.state.db.notifications.create_index([("toUser", 1), ("read", 1), ("createdAt", -1)])
     await app.state.db.contract_acceptances.create_index([("licensee_id", 1), ("accepted_at", -1)])
+    # BPM analysis cache — keyed by file SHA-256, auto-expires after 30d
+    await app.state.db.bpm_cache.create_index("created_at", expireAfterSeconds=30 * 24 * 3600)
     print("Indexes ready")
     yield
     app.state.mongo.close()
@@ -79,6 +82,7 @@ app.include_router(posts_router,           prefix="/api/posts",          tags=["
 app.include_router(ai_router,              prefix="/api/ai",             tags=["AI"])
 app.include_router(notifications_router,   prefix="/api/notifications",  tags=["Notifications"])
 app.include_router(contracts_router,       prefix="/api/contracts",      tags=["Contracts"])
+app.include_router(bpm_router,             prefix="/api/bpm",            tags=["BPM Detection"])
 
 from routes.producer import lease_webhook
 app.post("/api/producer/lease-webhook")(lease_webhook)
