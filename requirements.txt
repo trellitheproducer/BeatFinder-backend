@@ -11,20 +11,27 @@ pydantic[email]
 email-validator
 python-multipart
 reportlab>=4.0.0
-# ── BPM detection ─────────────────────────────────────────────────────────
-# All versions below MUST have pre-built Linux x86_64 wheels for the Python
-# version pinned in runtime.txt (3.11.9). Source-compiling any of these on
-# Render's free-tier 512MB build container will OOM and fail with
-# "metadata-generation-failed".
-#
-# If scipy still fails to install, the Python version is wrong — check
-# runtime.txt is at the repo root next to requirements.txt, AND go to
-# Render → Settings → Environment → confirm PYTHON_VERSION is NOT set
-# (the env var, if present, overrides runtime.txt).
+
+# ── BPM detection (pure-numpy build — no scipy/librosa/numba) ─────────────
+
+# After repeated build failures with the scipy/librosa/numba stack on
+
+# Render free tier, the BPM detector was rewritten to use only numpy +
+
+# soundfile + audioread. This adds only ~30 MB to the install and has
+
+# pre-built wheels for every Python version.
+
+# 
+
+# Trade-off: slightly less accurate than librosa’s Ellis 2007 beat tracker
+
+# on noisy material, but rock-solid on produced music (the target use case).
+
+# Half/double-time correction, confidence scoring, and beat grid are all
+
+# implemented in routes/bpm.py with vectorised numpy.
+
 numpy==1.26.4
-scipy==1.11.4
-llvmlite==0.41.1
-numba==0.58.1
 soundfile==0.12.1
 audioread==3.0.1
-librosa==0.10.1
