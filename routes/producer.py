@@ -139,6 +139,7 @@ async def upload_beat(
         "producer_id":       str(user["_id"]),
         "producer_username": user.get("username", ""),
         "producer_avatar":   user_doc.get("avatarUrl", "") if user_doc else "",
+        "beat_artwork":      user_doc.get("beatArtworkUrl", "") if user_doc else "",
         "stripe_account_id": stripe_account_id,
         "uploaded_at":       datetime.utcnow(),
         "downloads":         0,
@@ -174,6 +175,7 @@ async def list_producer_beats(request: Request):
     producer_ids = list({d.get("producer_id") for d in docs if d.get("producer_id")})
     avatar_map = {}
     username_map = {}
+    artwork_map = {}
     if producer_ids:
         from bson import ObjectId as _ObjId
         valid_ids = []
@@ -181,11 +183,15 @@ async def list_producer_beats(request: Request):
             try: valid_ids.append(_ObjId(pid))
             except Exception: pass
         if valid_ids:
-            users = await db.users.find({"_id": {"$in": valid_ids}}, {"avatarUrl": 1, "username": 1}).to_list(100)
+            users = await db.users.find(
+                {"_id": {"$in": valid_ids}},
+                {"avatarUrl": 1, "username": 1, "beatArtworkUrl": 1}
+            ).to_list(100)
             for u in users:
                 uid = str(u["_id"])
                 avatar_map[uid]   = u.get("avatarUrl", "")
                 username_map[uid] = u.get("username", "")
+                artwork_map[uid]  = u.get("beatArtworkUrl", "")
 
     return [
         {
@@ -198,6 +204,7 @@ async def list_producer_beats(request: Request):
             "producer_id":       d.get("producer_id"),
             "producer_username": username_map.get(d.get("producer_id", ""), d.get("producer_username", "")),
             "producer_avatar":   avatar_map.get(d.get("producer_id", ""), d.get("producer_avatar", "")),
+            "beat_artwork":      artwork_map.get(d.get("producer_id", ""), d.get("beat_artwork", "")),
             "stripe_account_id": d.get("stripe_account_id"),
             "downloads":         d.get("downloads", 0),
             "playCount":         d.get("playCount", 0),
