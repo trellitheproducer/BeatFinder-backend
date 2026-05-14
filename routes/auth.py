@@ -1063,6 +1063,11 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
                 return {
                     "username":     ainfo.get("username", p.get("username", "")),
                     "user_avatar":  ainfo.get("avatarUrl", p.get("avatarUrl", "")),
+                    # Author's plan — used by the frontend to decide
+                    # whether to render the verified tick next to their
+                    # name on post cards. May be empty for legacy posts
+                    # whose author can't be resolved in user_map.
+                    "plan":         ainfo.get("plan", ""),
                     "text":         p.get("text", ""),
                     "images":       p.get("images", []),
                     "type":         p.get("type", "status"),
