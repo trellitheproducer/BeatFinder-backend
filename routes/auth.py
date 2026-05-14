@@ -52,6 +52,7 @@ def _public(user: dict) -> dict:
             "subscriptionActive":    True,
             "subscriptionExpiresAt": None,
             "billingInterval":       "lifetime",
+            "terms_accepted_version": user.get("terms_accepted_version", ""),
         }
 
     expires_at = user.get("subscription_expires_at")
@@ -91,6 +92,7 @@ def _public(user: dict) -> dict:
         "subscriptionActive":    sub_active,
         "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
         "billingInterval":       user.get("billing_interval", "monthly"),
+        "terms_accepted_version": user.get("terms_accepted_version", ""),
     }
 
 
@@ -136,6 +138,36 @@ async def login(body: LoginRequest, request: Request):
 @router.get("/me")
 async def me(user=Depends(get_current_user)):
     return _public(user)
+
+
+# ── Accept Terms & Conditions ────────────────────────────────────
+# Persists the user's acceptance of a specific Terms version.
+# Versioning lets us re-prompt all users when the legal text changes:
+# bump TERMS_VERSION on the frontend and every user is automatically
+# shown the new modal on next load (because their stored version no
+# longer matches).
+class AcceptTermsRequest(BaseModel):
+    version: str
+
+@router.post("/accept-terms")
+async def accept_terms(body: AcceptTermsRequest, request: Request, user=Depends(get_current_user)):
+    if not body.version or not isinstance(body.version, str) or len(body.version) > 32:
+        raise HTTPException(status_code=400, detail="Invalid version")
+    db = request.app.state.db
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "terms_accepted_version": body.version,
+                "terms_accepted_at":      datetime.utcnow(),
+            }
+        },
+    )
+    return {
+        "success": True,
+        "version": body.version,
+        "accepted_at": datetime.utcnow().isoformat(),
+    }
 
 
 # ── Upgrade plan ──────────────────────────────────────────────────
