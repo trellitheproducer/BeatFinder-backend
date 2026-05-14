@@ -157,11 +157,55 @@ def _youtube_video_id(url: str) -> str:
 
 def _youtube_thumbnail(video_id: str) -> str:
     """Return the highest-quality YouTube thumbnail URL for a video id.
-    `maxresdefault.jpg` is available for almost every video that's had any
-    significant view count; for newer/obscure videos we'd want hqdefault
-    as a fallback but most clients silently fall back already."""
+    Synchronous fallback — picks `hqdefault.jpg` which is available for
+    EVERY YouTube video without needing a network probe. Used when we
+    can't do an async probe (e.g. inline construction)."""
     if not video_id:
         return ""
+    return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+
+async def _best_youtube_thumbnail(video_id: str) -> str:
+    """Async variant: probe YouTube's thumbnail CDN for the highest
+    available quality. Order is maxresdefault → sddefault → hqdefault.
+    `maxresdefault` only exists for HD videos that someone watched in
+    HD, but when it exists it's by far the nicest preview. hqdefault is
+    the universal fallback — guaranteed to exist for every video.
+
+    Returns the URL of the highest-resolution image that actually
+    exists. Probes use HEAD requests with a 3s timeout, so worst-case
+    cost is ~9s for an exotic video — but maxresdefault hits typically
+    succeed in <500ms."""
+    if not video_id:
+        return ""
+    candidates = [
+        f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/sddefault.jpg",
+        f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+    ]
+    # YouTube returns 404 (sometimes 200 + a tiny placeholder) for
+    # missing thumbnails. We HEAD then check content-length: real
+    # thumbnails are 10KB+; the placeholder is ~1KB.
+    try:
+        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
+            for url in candidates:
+                try:
+                    r = await client.head(url)
+                    if r.status_code == 200:
+                        # Some YT regions/edges return a 120x90 placeholder
+                        # gray image at 200 OK for missing thumbnails;
+                        # filter those out by content-length.
+                        cl = r.headers.get("content-length")
+                        if cl and cl.isdigit() and int(cl) < 5000:
+                            continue
+                        return url
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # If every probe failed (network down, CDN issue, etc), still hand
+    # back hqdefault — it's the safest universal fallback and the
+    # placeholder gradient will render if even THAT 404s in the browser.
     return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
 
@@ -280,13 +324,27 @@ async def _fetch_link_preview(url: str) -> dict:
     # Resolve relative og:image URLs against the final URL
     image = _absolute_url(url, image)
 
-    # YouTube safety net: if we have a video id and no usable image came
-    # back from the page, build the thumbnail URL directly. Same for if we
-    # somehow got nothing from the page at all (network error, etc).
-    if yt_id and (not image or "youtube.com" not in image and "ytimg" not in image and "youtu.be" not in image):
-        image = _youtube_thumbnail(yt_id)
-    if yt_id and not title:
-        title = "YouTube"  # at least something visible
+    # YouTube override: for known YouTube videos, ALWAYS use the direct
+    # video thumbnail URL — not whatever og:image came back from the page.
+    # YouTube sometimes serves a generic brand logo as og:image (for age-
+    # restricted, region-blocked, or freshly-uploaded videos) which would
+    # otherwise produce the giant red "YouTube" placeholder. The direct
+    # img.youtube.com URL is reliable and gives us the actual video frame.
+    if yt_id:
+        better = await _best_youtube_thumbnail(yt_id)
+        if better:
+            image = better
+        if not title or title.lower() == "youtube":
+            # OG title was missing or just "YouTube" (the brand) — try to
+            # find the video title elsewhere on the page.
+            if body and not title:
+                m = re.search(r'<title>([^<]+)</title>', body, re.IGNORECASE)
+                if m:
+                    title = m.group(1).replace(" - YouTube", "").strip()
+            if not title:
+                title = "YouTube Video"
+        if not site_name:
+            site_name = "YouTube"
 
     # Default siteName to the hostname when site doesn't provide one — gives
     # the preview card something to show as the small uppercase header.
