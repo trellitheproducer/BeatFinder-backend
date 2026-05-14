@@ -11,27 +11,16 @@ pydantic[email]
 email-validator
 python-multipart
 reportlab>=4.0.0
-
 # ── BPM detection (pure-numpy build — no scipy/librosa/numba) ─────────────
-
 # After repeated build failures with the scipy/librosa/numba stack on
-
 # Render free tier, the BPM detector was rewritten to use only numpy +
-
 # soundfile + audioread. This adds only ~30 MB to the install and has
-
 # pre-built wheels for every Python version.
-
-# 
-
-# Trade-off: slightly less accurate than librosa’s Ellis 2007 beat tracker
-
+#
+# Trade-off: slightly less accurate than librosa's Ellis 2007 beat tracker
 # on noisy material, but rock-solid on produced music (the target use case).
-
 # Half/double-time correction, confidence scoring, and beat grid are all
-
 # implemented in routes/bpm.py with vectorised numpy.
-
 numpy==1.26.4
 soundfile==0.12.1
 audioread==3.0.1
