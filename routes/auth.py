@@ -912,36 +912,48 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
     if not feed_user_ids:
         return []
 
-    # Convert to ObjectId list for joining against users collection
-    from bson import ObjectId as _ObjId
-    valid_pids = []
-    for pid in feed_user_ids:
-        try: valid_pids.append(_ObjId(pid))
-        except Exception: pass
-
     # Batch-fetch user details up front so we have avatar/username for
     # every item without per-item queries. Includes the current user too.
+    #
+    # The users collection contains a mix of legacy ObjectId _ids and newer
+    # string _ids (register() now uses str(ObjectId())). We query BOTH formats
+    # in one $or so neither group is missed. Without this, the user_map ended
+    # up empty for string-_id users, which silently emptied the post username
+    # filter below — meaning posts never appeared in the feed.
+    from bson import ObjectId as _ObjId
+    objid_pids = []
+    for pid in feed_user_ids:
+        try: objid_pids.append(_ObjId(pid))
+        except Exception: pass
+
     user_map = {}
-    if valid_pids:
-        followed = await db.users.find(
-            {"_id": {"$in": valid_pids}},
-            {"avatarUrl": 1, "username": 1, "name": 1, "plan": 1}
-        ).to_list(500)
-        for f in followed:
-            user_map[str(f["_id"])] = {
-                "username":  f.get("username", ""),
-                "name":      f.get("name", ""),
-                "avatarUrl": f.get("avatarUrl", ""),
-                "plan":      f.get("plan", "free"),
-            }
+    or_clauses = [{"_id": {"$in": feed_user_ids}}]  # string _ids
+    if objid_pids:
+        or_clauses.append({"_id": {"$in": objid_pids}})  # legacy ObjectId _ids
+
+    followed = await db.users.find(
+        {"$or": or_clauses},
+        {"avatarUrl": 1, "username": 1, "name": 1, "plan": 1}
+    ).to_list(500)
+    for f in followed:
+        user_map[str(f["_id"])] = {
+            "username":  f.get("username", ""),
+            "name":      f.get("name", ""),
+            "avatarUrl": f.get("avatarUrl", ""),
+            "plan":      f.get("plan", "free"),
+        }
 
     items = []
 
     # 1) Recent beat uploads from followed producers (and user's own beats)
+    # Over-fetch so the final merge-trim doesn't starve the OTHER kind of
+    # item (posts). A producer who uploads 30 beats today shouldn't push
+    # everyone else's status posts off the feed entirely.
+    fetch_each = max(limit, 50)
     try:
         beat_docs = await db.producer_beats.find(
             {"producer_id": {"$in": feed_user_ids}}
-        ).sort("uploaded_at", -1).limit(limit).to_list(limit)
+        ).sort("uploaded_at", -1).limit(fetch_each).to_list(fetch_each)
         for b in beat_docs:
             pid = b.get("producer_id", "")
             pinfo = user_map.get(pid, {})
@@ -1008,7 +1020,7 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
             # back to created_at for old / alternative-named docs.
             post_docs = await posts_coll.find(post_query).sort([
                 ("createdAt", -1), ("created_at", -1),
-            ]).limit(limit).to_list(limit)
+            ]).limit(fetch_each).to_list(fetch_each)
             for p in post_docs:
                 created = p.get("createdAt") or p.get("created_at")
                 # Resolve author info: prefer user_map by id, fall back to fields on the post
