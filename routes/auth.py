@@ -890,12 +890,16 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
     # Get list of user IDs the current user follows
     follow_docs = await db.follows.find({"follower_id": user_id}).to_list(500)
     following_ids = [f["following_id"] for f in follow_docs]
-    if not following_ids:
-        return []
+
+    # ALWAYS include the user themselves so they see their own posts in
+    # the feed (Twitter / X behaviour — your own activity is part of your
+    # timeline). Even with zero follows, the user still sees their stuff.
+    feed_user_ids = list(set(following_ids + [user_id]))
 
     # Exclude anyone the user has blocked OR who has blocked the user.
     # The block endpoint already unfollows in both directions, but we filter
-    # again here defensively in case of stale data.
+    # again here defensively in case of stale data. Never exclude the user
+    # themselves from their own feed.
     block_docs = await db.blocks.find({
         "$or": [{"blocker_id": user_id}, {"blocked_id": user_id}]
     }).to_list(1000)
@@ -904,19 +908,19 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
         blocked_set.add(b.get("blocker_id"))
         blocked_set.add(b.get("blocked_id"))
     blocked_set.discard(user_id)
-    following_ids = [fid for fid in following_ids if fid not in blocked_set]
-    if not following_ids:
+    feed_user_ids = [fid for fid in feed_user_ids if fid not in blocked_set]
+    if not feed_user_ids:
         return []
 
     # Convert to ObjectId list for joining against users collection
     from bson import ObjectId as _ObjId
     valid_pids = []
-    for pid in following_ids:
+    for pid in feed_user_ids:
         try: valid_pids.append(_ObjId(pid))
         except Exception: pass
 
-    # Batch-fetch followed user details up front so we have avatar/username
-    # for every item without per-item queries.
+    # Batch-fetch user details up front so we have avatar/username for
+    # every item without per-item queries. Includes the current user too.
     user_map = {}
     if valid_pids:
         followed = await db.users.find(
@@ -933,10 +937,10 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
 
     items = []
 
-    # 1) Recent beat uploads from followed producers
+    # 1) Recent beat uploads from followed producers (and user's own beats)
     try:
         beat_docs = await db.producer_beats.find(
-            {"producer_id": {"$in": following_ids}}
+            {"producer_id": {"$in": feed_user_ids}}
         ).sort("uploaded_at", -1).limit(limit).to_list(limit)
         for b in beat_docs:
             pid = b.get("producer_id", "")
@@ -975,9 +979,10 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
     except Exception:
         pass
 
-    # 2) Recent posts (status / music / video) from any followed user.
-    # Tries a few common collection names since the posts router may
-    # use any of these. Silently skips if none exist or query errors.
+    # 2) Recent posts (status / music / video) — from followed users AND
+    # from the current user themselves. Tries a few common collection
+    # names since the posts router may use any of these. Silently skips
+    # if none exist or query errors.
     posts_coll = None
     for name in ("posts", "user_posts", "social_posts"):
         try:
@@ -988,18 +993,24 @@ async def activity_feed(request: Request, limit: int = 30, user=Depends(get_curr
             continue
     if posts_coll is not None:
         try:
-            # Posts may store author by user_id (ObjectId or str), or by username.
-            # We support both.
+            # Posts may store author by user_id (ObjectId or str), or by
+            # username. We support all three. The username path is what
+            # posts.py actually uses today.
+            usernames_in_feed = [u.get("username") for u in user_map.values() if u.get("username")]
             post_query = {
                 "$or": [
-                    {"user_id":   {"$in": following_ids}},
-                    {"author_id": {"$in": following_ids}},
-                    {"username":  {"$in": [u.get("username") for u in user_map.values() if u.get("username")]}},
+                    {"user_id":   {"$in": feed_user_ids}},
+                    {"author_id": {"$in": feed_user_ids}},
+                    {"username":  {"$in": usernames_in_feed}},
                 ]
             }
-            post_docs = await posts_coll.find(post_query).sort("created_at", -1).limit(limit).to_list(limit)
+            # Sort by createdAt (camelCase — what posts.py writes). Falls
+            # back to created_at for old / alternative-named docs.
+            post_docs = await posts_coll.find(post_query).sort([
+                ("createdAt", -1), ("created_at", -1),
+            ]).limit(limit).to_list(limit)
             for p in post_docs:
-                created = p.get("created_at") or p.get("createdAt")
+                created = p.get("createdAt") or p.get("created_at")
                 # Resolve author info: prefer user_map by id, fall back to fields on the post
                 author_id = str(p.get("user_id") or p.get("author_id") or "")
                 ainfo = user_map.get(author_id, {})
