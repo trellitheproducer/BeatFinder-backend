@@ -26,6 +26,41 @@ def _id():
     return str(ObjectId())
 
 
+async def _notify_about_post(db, to_user: str, from_user: str, kind: str, text: str, post_id: str):
+    """Create a notification document that carries the post id, so the
+    frontend can deep-link to the post when the user taps the notif.
+
+    Field names match the schema used by routes/notifications.py
+    (`toUser` / `fromUser` / `text` / `read` / `createdAt`) plus the
+    extras already serialised by _notif_out there (`postId`, `postType`,
+    `count`). We bypass create_notification() because its signature
+    doesn't accept post_id — writing the doc ourselves keeps the
+    deep-link field in place. Skips self-notifications, matching the
+    existing helper's behaviour."""
+    if not to_user or to_user == from_user:
+        return
+    try:
+        await db.notifications.insert_one({
+            "_id":       _id(),
+            "toUser":    to_user,
+            "fromUser":  from_user or "",
+            "type":      kind,
+            "text":      text,
+            "postId":    post_id or "",
+            "postType":  "",          # not relevant for like/comment/repost
+            "count":     1,           # like/comment/repost notifs aren't bundled
+            "read":      False,
+            "createdAt": datetime.utcnow(),
+        })
+    except Exception:
+        # Don't crash the request that triggered the notification — at
+        # worst the user just doesn't get notified. We deliberately do
+        # NOT fall back to create_notification here because it would
+        # also fail with the same DB error and we'd lose the postId
+        # silently. Better to log and move on.
+        pass
+
+
 # ── Open Graph metadata parser ────────────────────────────────────────────────
 # Used for the in-post link previews. We pull og:title / og:description /
 # og:image / og:site_name from the <head>; falling back to <title> and the
@@ -821,8 +856,10 @@ async def like_post(post_id: str, request: Request, user=Depends(get_current_use
     # Notify post owner
     post_doc = await db.posts.find_one({"_id": post_id})
     if post_doc:
-        await create_notification(db, post_doc.get("username"), username, "like",
-            f"@{username} liked your post")
+        await _notify_about_post(
+            db, post_doc.get("username"), username, "like",
+            f"@{username} liked your post", post_id,
+        )
     return {"liked": True}
 
 
@@ -884,9 +921,9 @@ async def repost_post(post_id: str, request: Request, user=Depends(get_current_u
     await db.posts.update_one({"_id": underlying_id}, {"$inc": {"repostCount": 1}})
 
     # Notify the original poster
-    await create_notification(
+    await _notify_about_post(
         db, original.get("username"), username, "repost",
-        f"@{username} reposted your post"
+        f"@{username} reposted your post", underlying_id,
     )
     return {"reposted": True, "id": doc["_id"]}
 
@@ -959,8 +996,11 @@ async def add_comment(post_id: str, body: CommentBody, request: Request, user=De
     # Notify post owner
     post_doc = await db.posts.find_one({"_id": post_id})
     if post_doc:
-        await create_notification(db, post_doc.get("username"), user.get("username"), "comment",
-            f"@{user.get('username')} commented: \"{body.text.strip()[:60]}\"")
+        await _notify_about_post(
+            db, post_doc.get("username"), user.get("username"), "comment",
+            f"@{user.get('username')} commented: \"{body.text.strip()[:60]}\"",
+            post_id,
+        )
     return _comment_out(doc)
 
 
