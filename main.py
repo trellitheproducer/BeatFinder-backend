@@ -23,6 +23,7 @@ from routes.ai import router as ai_router
 from routes.notifications import router as notifications_router
 from routes.contracts import router as contracts_router
 from routes.bpm import router as bpm_router
+from support_routes import router as support_router
 
 load_dotenv()
 
@@ -83,6 +84,7 @@ app.include_router(ai_router,              prefix="/api/ai",             tags=["
 app.include_router(notifications_router,   prefix="/api/notifications",  tags=["Notifications"])
 app.include_router(contracts_router,       prefix="/api/contracts",      tags=["Contracts"])
 app.include_router(bpm_router,             prefix="/api/bpm",            tags=["BPM Detection"])
+app.include_router(support_router,         prefix="/api",                tags=["Support"])
 
 from routes.producer import lease_webhook
 app.post("/api/producer/lease-webhook")(lease_webhook)
