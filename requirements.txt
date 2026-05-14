@@ -12,12 +12,19 @@ email-validator
 python-multipart
 reportlab>=4.0.0
 # ── BPM detection ─────────────────────────────────────────────────────────
-# librosa needs numpy + scipy + numba transitively. Pinned to versions that
-# install cleanly on Render's Python 3.11 image without needing custom wheels.
-# soundfile handles WAV/FLAC/OGG natively; audioread provides MP3/M4A via
-# Render's pre-installed ffmpeg/libav.
-librosa==0.10.2.post1
+# All versions below MUST have pre-built Linux x86_64 wheels for the Python
+# version pinned in runtime.txt (3.11.9). Source-compiling any of these on
+# Render's free-tier 512MB build container will OOM and fail with
+# "metadata-generation-failed".
+#
+# If scipy still fails to install, the Python version is wrong — check
+# runtime.txt is at the repo root next to requirements.txt, AND go to
+# Render → Settings → Environment → confirm PYTHON_VERSION is NOT set
+# (the env var, if present, overrides runtime.txt).
+numpy==1.26.4
+scipy==1.11.4
+llvmlite==0.41.1
+numba==0.58.1
 soundfile==0.12.1
 audioread==3.0.1
-numpy>=1.24,<2.0
-scipy>=1.11,<1.14
+librosa==0.10.1
