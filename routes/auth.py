@@ -53,6 +53,7 @@ def _public(user: dict) -> dict:
             "subscriptionExpiresAt": None,
             "billingInterval":       "lifetime",
             "terms_accepted_version": user.get("terms_accepted_version", ""),
+            "beatArtworkUrl":         user.get("beatArtworkUrl", ""),
         }
 
     expires_at = user.get("subscription_expires_at")
@@ -93,6 +94,7 @@ def _public(user: dict) -> dict:
         "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
         "billingInterval":       user.get("billing_interval", "monthly"),
         "terms_accepted_version": user.get("terms_accepted_version", ""),
+        "beatArtworkUrl":         user.get("beatArtworkUrl", ""),
     }
 
 
@@ -1092,6 +1094,74 @@ async def upload_header(
     )
 
     return {"headerUrl": header_url}
+
+
+# ── Upload beat artwork (default image for ALL beats by this producer) ───
+# Producers can set one image that displays on every beat card they upload.
+# Updating this updates ALL existing beats by this producer so cards show
+# the latest artwork. Mirrors the avatar upload pattern.
+@router.post("/beat-artwork")
+async def upload_beat_artwork(
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    import httpx, hashlib, time as _time
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image (JPEG, PNG, etc.)")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large — maximum 5MB")
+
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Image storage not configured")
+
+    timestamp = int(_time.time())
+    folder    = "beatfinder/beat-artwork"
+    public_id = "artwork_" + str(user["_id"])
+
+    to_sign   = f"folder={folder}&public_id={public_id}&timestamp={timestamp}" + api_secret
+    signature = hashlib.sha256(to_sign.encode()).hexdigest()
+
+    upload_url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            upload_url,
+            data={
+                "api_key":   api_key,
+                "timestamp": timestamp,
+                "folder":    folder,
+                "public_id": public_id,
+                "signature": signature,
+            },
+            files={"file": (file.filename, file_bytes, file.content_type)},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Artwork upload failed: " + resp.text)
+
+    artwork_url = resp.json().get("secure_url", "")
+
+    db = request.app.state.db
+    # Save on user record so future uploads inherit it automatically
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"beatArtworkUrl": artwork_url}}
+    )
+    # Apply retroactively to every beat this producer has uploaded
+    await db.producer_beats.update_many(
+        {"producer_id": str(user["_id"])},
+        {"$set": {"beat_artwork": artwork_url}}
+    )
+
+    return {"beatArtworkUrl": artwork_url}
 
 
 # ── Admin: generate activation codes ─────────────────────────────
