@@ -143,8 +143,17 @@ def _public(user: dict) -> dict:
 async def register(body: RegisterRequest, request: Request):
     db = request.app.state.db
 
+    # Enforce server-side validation — frontend has the same checks but
+    # API clients (or a malicious user bypassing the UI) could otherwise
+    # create accounts with trivially-guessable passwords.
+    if not body.password or len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
     if len(body.password.encode("utf-8")) > 72:
         raise HTTPException(status_code=400, detail="Password too long. Maximum 72 characters.")
+    if not body.email or "@" not in body.email or "." not in body.email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+    if not body.name or not body.name.strip():
+        raise HTTPException(status_code=400, detail="Name is required.")
     if await db.users.find_one({"email": body.email}):
         raise HTTPException(status_code=409, detail="Email already registered")
 
@@ -1655,11 +1664,18 @@ async def record_beat_play(beat_id: str, request: Request):
     # Atomic increment on owner totalPlayCount
     producer_id = beat.get("producer_id")
     if producer_id:
+        # Try string match first (new accounts), fall back to ObjectId
+        # (legacy accounts) — same mixed-id pattern as other user lookups.
         try:
-            await db.users.update_one(
-                {"_id": ObjectId(producer_id)},
+            r = await db.users.update_one(
+                {"_id": producer_id},
                 {"$inc": {"totalPlayCount": 1}},
             )
+            if r.matched_count == 0:
+                await db.users.update_one(
+                    {"_id": ObjectId(producer_id)},
+                    {"$inc": {"totalPlayCount": 1}},
+                )
         except Exception:
             pass
 
