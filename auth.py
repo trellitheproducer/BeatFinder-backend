@@ -53,12 +53,25 @@ async def get_current_user(
 ):
     """
     Dependency — inject into any route that needs auth.
-    Returns the decoded token payload {"sub": user_id, "email": ...}
+    Returns the decoded token payload {"sub": user_id, "email": ...}.
+
+    Looks up the user by `_id` with a defensive both-formats query — newer
+    accounts store _id as a string (str(ObjectId())) while older accounts
+    have it as a BSON ObjectId. Without the fallback, legacy accounts
+    would get a 404 on every authenticated request, effectively locking
+    them out of the entire API.
     """
+    from bson import ObjectId
     payload = decode_token(credentials.credentials)
     db      = request.app.state.db
 
-    user = await db.users.find_one({"_id": payload["sub"]})
+    user_id = payload["sub"]
+    user    = await db.users.find_one({"_id": user_id})
+    if not user:
+        try:
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            user = None
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
