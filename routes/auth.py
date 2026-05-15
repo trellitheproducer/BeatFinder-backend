@@ -42,12 +42,20 @@ PLANS = {
 
 
 # ── Lifetime accounts — never expire ──────────────────────────────────
-# Single source of truth for who gets a permanent paid plan + admin flag.
-# Used by _public(), /profile/{username}, /profile-auth/{username},
-# /subscription-status, and anywhere else that needs to know whether a
-# user is on a lifetime plan. Adding a new lifetime user = add them here
-# and they'll show as Pro everywhere automatically (badges, ticks, plan
-# tags, gated features).
+# Two sources of truth, merged:
+#   1. LIFETIME_ACCOUNTS dict below — hardcoded permanent grants
+#      (Trelli/Mikez/HMbarsdat). Can't be revoked through admin UI,
+#      acts as a "floor" guaranteeing these accounts are always lifetime.
+#   2. db.lifetime_accounts collection — admin-grantable lifetime status.
+#      Documents look like:
+#        { "_id": "<username>", "plan": "artist" | "producer",
+#          "is_admin": false, "granted_at": <datetime>,
+#          "granted_by": "<admin_username>" }
+#
+# _lifetime_config() now checks the hardcoded dict FIRST (fast path),
+# then falls back to a DB lookup if not found. The DB lookup is async
+# so any synchronous call sites need to be updated — see _lifetime_config
+# below and its async variant _lifetime_config_async.
 LIFETIME_ACCOUNTS = {
     "Trelli":     {"plan": "producer", "is_admin": True},
     "Mikez":      {"plan": "artist",   "is_admin": False},
@@ -56,19 +64,51 @@ LIFETIME_ACCOUNTS = {
 
 
 def _lifetime_config(username: str):
-    """Return the lifetime config dict for the given username, or None
-    if the user isn't on a lifetime plan. Case-sensitive — usernames
-    must match exactly as keyed in LIFETIME_ACCOUNTS."""
+    """Synchronous lifetime check — only consults the hardcoded dict.
+    Used by code paths that aren't async (rare). For routes that ARE
+    async (most of them), prefer _lifetime_config_async which also
+    consults the database for admin-granted lifetimes."""
     if not username:
         return None
     return LIFETIME_ACCOUNTS.get(username)
+
+
+async def _lifetime_config_async(db, username: str):
+    """Async lifetime check — consults both the hardcoded dict AND the
+    db.lifetime_accounts collection. Returns the config dict or None.
+
+    Order:
+      1. Hardcoded dict (permanent floor — never revoked)
+      2. DB collection (admin-grantable, admin-revocable)
+    """
+    if not username:
+        return None
+    hard = LIFETIME_ACCOUNTS.get(username)
+    if hard:
+        return hard
+    try:
+        doc = await db.lifetime_accounts.find_one({"_id": username})
+        if doc:
+            return {
+                "plan":     doc.get("plan", "artist"),
+                "is_admin": bool(doc.get("is_admin", False)),
+            }
+    except Exception:
+        pass
+    return None
+
 
 
 def _public(user: dict) -> dict:
     from datetime import timezone
 
     username = user.get("username", "")
-    cfg = _lifetime_config(username)
+    # Prefer an override injected by the async endpoint (which has access
+    # to db.lifetime_accounts). Falls back to the synchronous hardcoded
+    # check so non-async call sites still work for the OG lifetime users.
+    cfg = user.get("__lifetime_override__")
+    if not cfg:
+        cfg = _lifetime_config(username)
     if cfg:
         return {
             "id":                    str(user["_id"]),
@@ -182,12 +222,17 @@ async def login(body: LoginRequest, request: Request):
     if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token(str(user["_id"]), user["email"])
+    # Inject lifetime override so DB-granted lifetime users get the
+    # right plan returned in the login response.
+    user["__lifetime_override__"] = await _lifetime_config_async(db, user.get("username", ""))
     return {"access_token": token, "user": _public(user)}
 
 
 # ── Me ────────────────────────────────────────────────────────────
 @router.get("/me")
-async def me(user=Depends(get_current_user)):
+async def me(request: Request, user=Depends(get_current_user)):
+    db = request.app.state.db
+    user["__lifetime_override__"] = await _lifetime_config_async(db, user.get("username", ""))
     return _public(user)
 
 
@@ -499,10 +544,19 @@ async def search_users(q: str, request: Request):
     ).limit(20).to_list(20)
 
     # Apply lifetime override so lifetime accounts surface their correct
-    # plan in search results too.
+    # plan in search results too. We batch-fetch the DB-granted lifetime
+    # accounts upfront so this stays O(1) DB calls regardless of result
+    # count.
+    db_lifetime_docs = await db.lifetime_accounts.find({}).to_list(500)
+    db_lifetime_map = {d["_id"]: d for d in db_lifetime_docs}
+
     def _row(d):
         uname = d.get("username", "")
-        cfg = _lifetime_config(uname)
+        cfg = LIFETIME_ACCOUNTS.get(uname) or (
+            {"plan": db_lifetime_map[uname].get("plan", "artist"),
+             "is_admin": bool(db_lifetime_map[uname].get("is_admin", False))}
+            if uname in db_lifetime_map else None
+        )
         return {
             "username":  uname,
             "name":      d.get("name", ""),
@@ -539,7 +593,7 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
     # a user who got marked lifetime in the LIFETIME_ACCOUNTS dict but
     # still has plan:"free" in the DB shows as a free account on their
     # public profile (no Pro tick, no plan chip).
-    lifetime_cfg = _lifetime_config(user.get("username", ""))
+    lifetime_cfg = await _lifetime_config_async(db, user.get("username", ""))
     effective_plan = lifetime_cfg["plan"] if lifetime_cfg else user.get("plan", "free")
 
     return {
@@ -594,9 +648,10 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Subscription status (called after Stripe redirect + on app load) ─
 @router.get("/subscription-status")
 async def subscription_status(request: Request, user=Depends(get_current_user)):
-    # Lifetime accounts — never auto-downgrade. Uses module-level
-    # LIFETIME_ACCOUNTS as the single source of truth.
-    cfg = _lifetime_config(user.get("username", ""))
+    db = request.app.state.db
+    # Lifetime accounts — never auto-downgrade. Uses both hardcoded dict
+    # and DB-granted lifetime list.
+    cfg = await _lifetime_config_async(db, user.get("username", ""))
     if cfg:
         return {
             "plan":                  cfg["plan"],
@@ -672,7 +727,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
     # Lifetime accounts: override the plan + force subscriptionActive=true
     # regardless of any stored subscription_expires_at. Without this they
     # display as Free on their public profile (no Pro tick / no plan chip).
-    lifetime_cfg = _lifetime_config(user.get("username", ""))
+    lifetime_cfg = await _lifetime_config_async(db, user.get("username", ""))
     if lifetime_cfg:
         effective_plan = lifetime_cfg["plan"]
         sub_active     = True
@@ -759,9 +814,15 @@ async def get_followers(username: str, request: Request):
     # Apply lifetime override so accounts on the lifetime list show their
     # correct plan (and therefore their badges) in this listing. Without
     # this, lifetime users with plan:"free" in the DB show as Free.
+    # Batch-fetch DB-granted lifetimes upfront so we stay O(1) DB calls.
+    db_lifetime_docs = await db.lifetime_accounts.find({}).to_list(500)
+    db_lifetime_map = {d["_id"]: d for d in db_lifetime_docs}
     def _row(u):
         uname = u.get("username", "")
-        cfg = _lifetime_config(uname)
+        cfg = LIFETIME_ACCOUNTS.get(uname) or (
+            {"plan": db_lifetime_map[uname].get("plan", "artist")}
+            if uname in db_lifetime_map else None
+        )
         return {
             "username":  uname,
             "name":      u.get("name", ""),
@@ -785,9 +846,14 @@ async def get_following(username: str, request: Request):
         return []
     users = await db.users.find({"_id": {"$in": following_ids}}, {"password": 0}).to_list(500)
     # Apply lifetime override — same reasoning as in get_followers above.
+    db_lifetime_docs = await db.lifetime_accounts.find({}).to_list(500)
+    db_lifetime_map = {d["_id"]: d for d in db_lifetime_docs}
     def _row(u):
         uname = u.get("username", "")
-        cfg = _lifetime_config(uname)
+        cfg = LIFETIME_ACCOUNTS.get(uname) or (
+            {"plan": db_lifetime_map[uname].get("plan", "artist")}
+            if uname in db_lifetime_map else None
+        )
         return {
             "username":  uname,
             "name":      u.get("name", ""),
@@ -1867,3 +1933,148 @@ async def get_my_tracks(request: Request, user=Depends(get_current_user)):
         }
         for t in tracks
     ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS — Lifetime account management
+# ════════════════════════════════════════════════════════════════════════
+# Only admins (users whose is_admin flag is true) can use these. Admin
+# status is determined by:
+#   1. Hardcoded LIFETIME_ACCOUNTS dict (Trelli is admin)
+#   2. is_admin flag stored on the user doc
+#
+# Admins can:
+#   • Grant lifetime access to any username (artist or producer plan)
+#   • Revoke admin-granted lifetime access
+#   • View the list of all admin-granted lifetimes
+#
+# Hardcoded lifetime accounts (Trelli/Mikez/HMbarsdat) CANNOT be revoked
+# through this UI — they are permanent. Admin must edit the source code
+# to change those.
+
+async def get_admin_user(
+    request: Request,
+    user=Depends(get_current_user),
+):
+    """Dependency that requires the requesting user to be an admin.
+    Returns the user dict if admin, raises 403 otherwise."""
+    db = request.app.state.db
+    username = user.get("username", "")
+    # Check hardcoded admin status first
+    cfg = LIFETIME_ACCOUNTS.get(username)
+    is_admin = bool(cfg and cfg.get("is_admin", False))
+    # Then check user doc flag (set manually in DB if needed)
+    if not is_admin:
+        is_admin = bool(user.get("is_admin", False))
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+from pydantic import BaseModel as _BaseModel
+
+
+class _GrantLifetimeBody(_BaseModel):
+    username: str
+    plan:     str  # "artist" | "producer"
+
+
+class _RevokeLifetimeBody(_BaseModel):
+    username: str
+
+
+@router.post("/admin/lifetime/grant")
+async def admin_grant_lifetime(
+    body: _GrantLifetimeBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    """Grant lifetime access to a username. Stores in db.lifetime_accounts
+    so it's picked up by _lifetime_config_async on subsequent /me, /login,
+    /search, /profile/* requests."""
+    db = request.app.state.db
+    uname = (body.username or "").strip()
+    plan  = (body.plan or "").strip().lower()
+    if not uname:
+        raise HTTPException(status_code=400, detail="username is required")
+    if plan not in ("artist", "producer"):
+        raise HTTPException(status_code=400, detail="plan must be 'artist' or 'producer'")
+    # Sanity-check: the username should actually exist as a registered user.
+    # We don't enforce this strictly (admin might want to pre-grant a
+    # lifetime before the user signs up), but warn in the response.
+    existing_user = await db.users.find_one({"username": uname})
+    # Don't allow re-granting one of the hardcoded permanent lifetimes —
+    # they're already in effect via LIFETIME_ACCOUNTS, and granting them
+    # in DB would just be noise.
+    if uname in LIFETIME_ACCOUNTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{uname} is already a permanent lifetime account (hardcoded)."
+        )
+    # Upsert — admins can also use this endpoint to change a user's
+    # lifetime plan (e.g. artist → producer).
+    await db.lifetime_accounts.update_one(
+        {"_id": uname},
+        {"$set": {
+            "plan":       plan,
+            "is_admin":   False,
+            "granted_at": datetime.utcnow(),
+            "granted_by": admin.get("username", ""),
+        }},
+        upsert=True,
+    )
+    return {
+        "ok":             True,
+        "username":       uname,
+        "plan":           plan,
+        "user_exists":    bool(existing_user),
+    }
+
+
+@router.post("/admin/lifetime/revoke")
+async def admin_revoke_lifetime(
+    body: _RevokeLifetimeBody,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    """Revoke an admin-granted lifetime access. Cannot revoke the
+    hardcoded permanent lifetimes (Trelli/Mikez/HMbarsdat)."""
+    db = request.app.state.db
+    uname = (body.username or "").strip()
+    if not uname:
+        raise HTTPException(status_code=400, detail="username is required")
+    if uname in LIFETIME_ACCOUNTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{uname} is a permanent lifetime account and cannot be revoked from the admin UI."
+        )
+    result = await db.lifetime_accounts.delete_one({"_id": uname})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"No lifetime grant found for {uname}")
+    return {"ok": True, "username": uname}
+
+
+@router.get("/admin/lifetime/list")
+async def admin_list_lifetimes(
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    """Return all admin-granted lifetime accounts (the editable ones).
+    Hardcoded permanent lifetimes are returned separately so the UI
+    can show them as read-only."""
+    db = request.app.state.db
+    docs = await db.lifetime_accounts.find({}).to_list(500)
+    granted = [
+        {
+            "username":   d.get("_id", ""),
+            "plan":       d.get("plan", "artist"),
+            "granted_at": d.get("granted_at", "").isoformat() if d.get("granted_at") else "",
+            "granted_by": d.get("granted_by", ""),
+        }
+        for d in docs
+    ]
+    permanent = [
+        {"username": uname, "plan": cfg["plan"], "is_admin": cfg.get("is_admin", False)}
+        for uname, cfg in LIFETIME_ACCOUNTS.items()
+    ]
+    return {"granted": granted, "permanent": permanent}
