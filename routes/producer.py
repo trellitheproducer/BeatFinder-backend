@@ -878,7 +878,8 @@ async def _try_get_user(request: Request):
     Used by the MP3 download endpoint where iOS sometimes strips headers
     from media-download requests so the frontend includes a fallback token
     in the query string."""
-    from auth import get_current_user as _gcu
+    from auth import get_current_user as _gcu, decode_token as _decode
+    from bson import ObjectId
     token = ""
     auth_hdr = request.headers.get("Authorization", "")
     if auth_hdr.lower().startswith("bearer "):
@@ -886,18 +887,34 @@ async def _try_get_user(request: Request):
     if not token:
         token = request.query_params.get("token", "").strip()
     if not token:
+        print("[BF download auth] no token in header or query param")
         return None
-    # Build a synthetic request-like shim so we can reuse the existing
-    # token-verification logic without re-implementing it. We add the token
-    # back into Authorization header for the helper to read.
+    # Decode token directly so we can do a more lenient user lookup than
+    # get_current_user does. Older accounts have _id stored as ObjectId
+    # while newer ones have it as a string — get_current_user only matches
+    # by string, so legacy accounts get 401 here for an entirely benign
+    # reason. We try both forms.
     try:
-        # Rewrite the request's authorization header in-place for this call
-        new_headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() != b"authorization"]
-        new_headers.append((b"authorization", ("Bearer " + token).encode()))
-        request.scope["headers"] = new_headers
-        return await _gcu(request)
-    except Exception:
+        payload = _decode(token)
+    except Exception as e:
+        print(f"[BF download auth] token decode failed: {e}")
         return None
+    user_id = payload.get("sub")
+    if not user_id:
+        print("[BF download auth] token has no sub")
+        return None
+    db = request.app.state.db
+    # Try string first (newer accounts), then ObjectId (legacy)
+    user = await db.users.find_one({"_id": user_id})
+    if not user:
+        try:
+            user = await db.users.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            user = None
+    if not user:
+        print(f"[BF download auth] user not found for sub={user_id}")
+        return None
+    return user
 
 
 @router.get("/beats/{beat_id}/file")
