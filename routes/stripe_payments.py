@@ -108,6 +108,77 @@ async def send_expiry_warning_email(to_email: str, name: str, plan: str, expires
         return False
 
 
+async def send_payment_failed_email(
+    to_email: str, name: str, plan: str, attempt_count: int, next_attempt_unix: int = 0
+) -> bool:
+    """Sent when Stripe fails to charge a subscription renewal. We tell the
+    user what to do (update card via the Customer Portal) and how long they
+    have. Stripe will automatically retry the charge a few times over the
+    next ~3 weeks before giving up and cancelling the subscription."""
+    plan_label = "Artist Pro" if plan == "artist" else "Producer Pro"
+
+    next_attempt_str = ""
+    if next_attempt_unix:
+        try:
+            next_attempt_dt  = datetime.utcfromtimestamp(next_attempt_unix)
+            next_attempt_str = next_attempt_dt.strftime("%d %B %Y")
+        except Exception:
+            next_attempt_str = ""
+
+    if attempt_count <= 1:
+        headline_color = "#F59E0B"  # amber — first warning
+        headline       = "We couldn't process your payment"
+        urgency        = ""
+    elif attempt_count <= 3:
+        headline_color = "#F97316"  # orange — second warning
+        headline       = "Payment still failing — action needed"
+        urgency        = "<div style='color:#F97316;font-weight:700;margin-bottom:16px'>This is attempt " + str(attempt_count) + ". If we can't charge your card, you'll lose access to your pro features.</div>"
+    else:
+        headline_color = "#EF4444"  # red — last warning
+        headline       = "Final notice — subscription about to be cancelled"
+        urgency        = "<div style='color:#EF4444;font-weight:700;margin-bottom:16px'>This was our last attempt. Your subscription will be cancelled in a few days unless you update your payment method now.</div>"
+
+    next_charge_html = ""
+    if next_attempt_str:
+        next_charge_html = "<div style='color:#888;font-size:13px;margin-bottom:16px'>We'll try again on <strong>" + next_attempt_str + "</strong>.</div>"
+
+    html = """
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#0a0a0a;color:white;padding:32px;border-radius:16px">
+  <div style="font-size:32px;font-weight:900;letter-spacing:4px;color:#C026D3;margin-bottom:8px">BEATFINDER</div>
+  <div style="color:""" + headline_color + """;font-size:18px;font-weight:700;margin-bottom:12px">""" + headline + """</div>
+  <div style="color:#aaa;margin-bottom:16px">Hi """ + name + """, your """ + plan_label + """ subscription payment was declined. This usually means your card has expired, been replaced, or your bank blocked the charge.</div>
+  """ + urgency + next_charge_html + """
+  <div style="color:white;font-weight:700;margin-bottom:12px">To fix this:</div>
+  <ol style="color:#aaa;line-height:1.7;padding-left:20px;margin-bottom:24px">
+    <li>Sign in to BeatFinder</li>
+    <li>Go to your Profile → Settings (gear icon)</li>
+    <li>Tap "Manage Subscription"</li>
+    <li>Update your card on Stripe's secure portal</li>
+  </ol>
+  <div style="color:#555;font-size:12px;margin-top:24px">Questions or need help? trellitheproducer@gmail.com</div>
+</div>
+"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": "Bearer " + RESEND_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from":    "BeatFinder <onboarding@resend.dev>",
+                    "to":      [to_email],
+                    "subject": "Payment failed for your BeatFinder " + plan_label + " subscription",
+                    "html":    html,
+                },
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print("[Email] Failed to send payment-failed email: " + str(e))
+        return False
+
+
 # ── Create Stripe Checkout Session ───────────────────────────────────────────
 
 @router.post("/create-checkout")
@@ -344,6 +415,12 @@ async def stripe_webhook(request: Request):
             "billing_interval":        billing,
             "stripe_subscription_id":  sub_id,
             "subscription_expires_at": expires_dt,
+            # Clear any failing-payment flag from a previous declined attempt —
+            # successful charge means whatever was wrong is now fixed.
+            "payment_failing":         False,
+            "payment_failed_at":       None,
+            "payment_failed_attempt":  0,
+            "payment_failed_next_retry": None,
         }
         # Only set customer_id if we actually have one — avoid wiping a
         # previously-stored value with an empty string on a re-fire.
@@ -361,6 +438,83 @@ async def stripe_webhook(request: Request):
             print("[Stripe] Welcome email sent=" + str(sent))
         else:
             print("[Stripe] User not found for email: " + user_email)
+
+    # ── Payment failed (declined card / expired card / etc) ───────────────
+    elif event.get("type") == "invoice.payment_failed":
+        # Stripe will automatically retry the charge a few times over the
+        # next ~3 weeks per their Smart Retries logic, then fire
+        # customer.subscription.deleted if all attempts fail.
+        #
+        # Our job here:
+        #   1. Mark the user as "payment failing" in our DB
+        #   2. Email them with instructions to fix their card via Portal
+        #   3. Keep their pro access active for now — Stripe handles the
+        #      retry cadence, and the existing customer.subscription.deleted
+        #      handler downgrades them when all retries are exhausted.
+        invoice         = event["data"]["object"]
+        sub_id          = invoice.get("subscription") or ""
+        customer_id     = invoice.get("customer") or ""
+        attempt_count   = int(invoice.get("attempt_count") or 1)
+        next_attempt_ts = invoice.get("next_payment_attempt") or 0
+        user_email      = invoice.get("customer_email", "") or ""
+
+        # Fallback: look up customer if no email on invoice
+        if not user_email and customer_id:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    cr = await client.get(
+                        "https://api.stripe.com/v1/customers/" + customer_id,
+                        auth=(STRIPE_SECRET, ""),
+                    )
+                    user_email = cr.json().get("email", "")
+            except Exception as e:
+                print("[Stripe] payment_failed customer lookup error: " + str(e))
+
+        if not user_email:
+            print("[Stripe] payment_failed: no email, skipping")
+            return {"received": True}
+
+        # Mark the user as having a failing payment. We don't downgrade —
+        # Stripe will retry and the subscription is still technically active
+        # until it's cancelled. This flag is mostly for UI hints / debugging.
+        user_doc = await db.users.find_one({"email": user_email})
+        if not user_doc:
+            print("[Stripe] payment_failed: no user for " + user_email)
+            return {"received": True}
+
+        await db.users.update_one(
+            {"email": user_email},
+            {"$set": {
+                "payment_failing":            True,
+                "payment_failed_at":          datetime.utcnow(),
+                "payment_failed_attempt":     attempt_count,
+                "payment_failed_next_retry":  datetime.utcfromtimestamp(next_attempt_ts) if next_attempt_ts else None,
+            }}
+        )
+
+        plan = user_doc.get("plan", "")
+        name = user_doc.get("name", "")
+
+        # Send the warning email — escalates wording at attempts 1/2-3/4+
+        sent = await send_payment_failed_email(
+            user_email, name, plan, attempt_count, next_attempt_ts
+        )
+        print(
+            "[Stripe] payment_failed for " + user_email +
+            " (attempt " + str(attempt_count) + "), email_sent=" + str(sent)
+        )
+
+    # ── Payment recovered after a failed attempt ──────────────────────────
+    elif event.get("type") == "invoice.payment_succeeded":
+        # This event ALREADY fires inside the big upgrade handler at the top
+        # of this webhook (in the same condition tree). We separately catch
+        # it here ONLY to clear the payment_failing flag if it was set —
+        # a successful charge means the user fixed their card.
+        # NOTE: the elif at the top of this function already returns by the
+        # time we reach here, so this branch is unreachable. Keeping the
+        # comment to document the design intent. The flag is cleared in the
+        # main success handler instead — see the plan_fields update there.
+        pass
 
     # ── Subscription renewed (next billing cycle paid) ────────────────────
     elif event.get("type") == "invoice.paid":
