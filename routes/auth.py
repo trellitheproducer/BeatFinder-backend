@@ -1315,10 +1315,36 @@ async def reset_password(body: ResetPasswordRequest, request: Request):
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
 
     new_hash = hash_password(body.new_password)
-    await db.users.update_one(
-        {"_id": ObjectId(doc["user_id"])},
+    user_id  = doc["user_id"]
+
+    # User _id storage is mixed across the DB: newer accounts store _id as
+    # a string (see register() — user_id = str(ObjectId())), older accounts
+    # have it as a BSON ObjectId. Try the string match first; if nothing
+    # was updated, fall back to ObjectId. Otherwise the update silently
+    # matches zero rows, the reset token gets marked as used, and the user
+    # ends up locked out (old password no longer "feels right" to them,
+    # new password was never persisted).
+    result = await db.users.update_one(
+        {"_id": user_id},
         {"$set": {"password": new_hash}}
     )
+    if result.matched_count == 0:
+        try:
+            result = await db.users.update_one(
+                {"_id": ObjectId(user_id)},
+                {"$set": {"password": new_hash}}
+            )
+        except Exception:
+            pass
+
+    # Fail loudly if we still couldn't find them — better to surface the
+    # error than to claim success and lock them out of their account.
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=500,
+            detail="Reset failed — could not locate your account. Contact support."
+        )
+
     await db.password_resets.update_one({"token": body.token}, {"$set": {"used": True}})
     return {"success": True, "message": "Password reset successfully."}
 
