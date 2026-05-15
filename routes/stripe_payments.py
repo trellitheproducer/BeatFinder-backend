@@ -323,6 +323,59 @@ async def create_customer_portal(
     return {"portal_url": session.get("url")}
 
 
+# ── Public pricing endpoint ────────────────────────────────────────────────
+# Returns the current price IDs + display strings so the frontend doesn't
+# have to hardcode them. When pricing changes in the future, you update
+# either this file (display strings) or your Render env vars (price IDs)
+# and the frontend picks it up on next load — no code deploy needed.
+#
+# Public (no auth required) so the signup screen can fetch it before the
+# user has an account.
+@router.get("/pricing")
+async def get_pricing():
+    return {
+        "subscriptions": {
+            "artist": {
+                "label":         "Artist Pro",
+                "monthly": {
+                    "price_id":  ARTIST_PRICE_ID,
+                    "amount":    4.99,
+                    "currency":  "GBP",
+                    "display":   "£4.99/mo",
+                },
+                "annual": {
+                    "price_id":  ARTIST_ANNUAL_PRICE_ID,
+                    "amount":    49.99,
+                    "currency":  "GBP",
+                    "display":   "£49.99/yr",
+                    "monthly_equivalent_display": "≈ £4.17/mo",
+                },
+            },
+            "producer": {
+                "label":         "Producer Pro",
+                "monthly": {
+                    "price_id":  PRODUCER_PRICE_ID,
+                    "amount":    8.99,
+                    "currency":  "GBP",
+                    "display":   "£8.99/mo",
+                },
+                "annual": {
+                    "price_id":  PRODUCER_ANNUAL_PRICE_ID,
+                    "amount":    89.99,
+                    "currency":  "GBP",
+                    "display":   "£89.99/yr",
+                    "monthly_equivalent_display": "≈ £7.50/mo",
+                },
+            },
+        },
+        "leases": {
+            "basic":   {"amount": 50.00,  "currency": "GBP", "display": "£50"},
+            "premium": {"min": 100,       "max": 500,        "currency": "GBP", "display": "£100–£500"},
+        },
+        "platform_fee_percent": 1,
+    }
+
+
 # ── Stripe Webhook ────────────────────────────────────────────────────────────
 
 @router.post("/webhook")
