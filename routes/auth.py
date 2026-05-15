@@ -489,16 +489,19 @@ async def search_users(q: str, request: Request):
         {"password": 0}
     ).limit(20).to_list(20)
 
-    return [
-        {
-            "username":  d.get("username", ""),
+    # Apply lifetime override so lifetime accounts surface their correct
+    # plan in search results too.
+    def _row(d):
+        uname = d.get("username", "")
+        cfg = _lifetime_config(uname)
+        return {
+            "username":  uname,
             "name":      d.get("name", ""),
-            "plan":      d.get("plan", "free"),
+            "plan":      cfg["plan"] if cfg else d.get("plan", "free"),
             "bio":       d.get("bio", ""),
             "avatarUrl": d.get("avatarUrl", ""),
         }
-        for d in docs if d.get("username")
-    ]
+    return [_row(d) for d in docs if d.get("username")]
 
 
 # ── Get public profile ────────────────────────────────────────────
@@ -744,15 +747,19 @@ async def get_followers(username: str, request: Request):
     if not follower_ids:
         return []
     users = await db.users.find({"_id": {"$in": follower_ids}}, {"password": 0}).to_list(500)
-    return [
-        {
-            "username":  u.get("username", ""),
+    # Apply lifetime override so accounts on the lifetime list show their
+    # correct plan (and therefore their badges) in this listing. Without
+    # this, lifetime users with plan:"free" in the DB show as Free.
+    def _row(u):
+        uname = u.get("username", "")
+        cfg = _lifetime_config(uname)
+        return {
+            "username":  uname,
             "name":      u.get("name", ""),
             "avatarUrl": u.get("avatarUrl", ""),
-            "plan":      u.get("plan", "free"),
+            "plan":      cfg["plan"] if cfg else u.get("plan", "free"),
         }
-        for u in users
-    ]
+    return [_row(u) for u in users]
 
 
 # ── Following list ───────────────────────────────────────────────
@@ -768,15 +775,17 @@ async def get_following(username: str, request: Request):
     if not following_ids:
         return []
     users = await db.users.find({"_id": {"$in": following_ids}}, {"password": 0}).to_list(500)
-    return [
-        {
-            "username":  u.get("username", ""),
+    # Apply lifetime override — same reasoning as in get_followers above.
+    def _row(u):
+        uname = u.get("username", "")
+        cfg = _lifetime_config(uname)
+        return {
+            "username":  uname,
             "name":      u.get("name", ""),
             "avatarUrl": u.get("avatarUrl", ""),
-            "plan":      u.get("plan", "free"),
+            "plan":      cfg["plan"] if cfg else u.get("plan", "free"),
         }
-        for u in users
-    ]
+    return [_row(u) for u in users]
 
 
 # ── Follow / unfollow ─────────────────────────────────────────────
