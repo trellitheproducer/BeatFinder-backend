@@ -22,6 +22,96 @@ STRIPE_API     = "https://api.stripe.com/v1"
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 
 
+async def send_lease_receipt_email(
+    to_email: str,
+    buyer_name: str,
+    beat_title: str,
+    producer_name: str,
+    producer_username: str,
+    price_gbp: float,
+    tier: str,
+    beat_id: str,
+) -> bool:
+    """Send a purchase receipt + licence summary email after a successful
+    beat lease purchase. Goes to the buyer only — producer can see sales
+    in their Stripe dashboard."""
+    tier_label  = "Premium Exclusive Lease" if tier == "premium" else "Basic Lease"
+    royalty_pct = "50%" if tier == "premium" else "75%"
+    exclusivity = (
+        "EXCLUSIVE — you are the only person who can use this beat commercially."
+        if tier == "premium"
+        else "Non-exclusive — other artists may also licence this beat. Note: if the producer later sells the Premium (exclusive) lease, your basic licence is voided per the agreement you accepted at purchase."
+    )
+    purchased_at = datetime.utcnow().strftime("%d %B %Y, %H:%M UTC")
+    display_name = buyer_name.strip() if buyer_name else "there"
+    # Format price with 2dp for whole numbers, sensible spacing
+    try:
+        price_display = "£" + ("{:,.2f}".format(float(price_gbp)))
+    except Exception:
+        price_display = "£" + str(price_gbp)
+
+    safe_beat_title     = (beat_title or "Untitled Beat").strip()
+    safe_producer_name  = (producer_name or "Unknown Producer").strip()
+    producer_handle     = ("@" + producer_username) if producer_username else ""
+
+    html = """
+<div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#0a0a0a;color:white;padding:32px;border-radius:16px">
+  <div style="font-size:32px;font-weight:900;letter-spacing:4px;color:#C026D3;margin-bottom:8px">BEATFINDER</div>
+  <div style="color:white;font-size:18px;font-weight:700;margin-bottom:8px">Receipt &amp; Licence Confirmation</div>
+  <div style="color:#aaa;margin-bottom:24px">Hi """ + display_name + """, thanks for your purchase. This email serves as your receipt and confirmation of the licence rights you've acquired.</div>
+
+  <div style="background:#111;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:20px">
+    <div style="color:#A78BFA;font-size:11px;font-weight:800;letter-spacing:1.5px;margin-bottom:12px">YOUR PURCHASE</div>
+    <table style="width:100%;color:#ddd;font-size:14px">
+      <tr><td style="padding:4px 0;color:#888;width:120px">Beat</td><td style="padding:4px 0;font-weight:700">""" + safe_beat_title + """</td></tr>
+      <tr><td style="padding:4px 0;color:#888">Producer</td><td style="padding:4px 0">""" + safe_producer_name + " " + producer_handle + """</td></tr>
+      <tr><td style="padding:4px 0;color:#888">Licence</td><td style="padding:4px 0;font-weight:700;color:""" + ("#C026D3" if tier == "premium" else "#3B82F6") + '">' + tier_label + """</td></tr>
+      <tr><td style="padding:4px 0;color:#888">Amount</td><td style="padding:4px 0;font-weight:700">""" + price_display + """</td></tr>
+      <tr><td style="padding:4px 0;color:#888">Date</td><td style="padding:4px 0">""" + purchased_at + """</td></tr>
+    </table>
+  </div>
+
+  <div style="background:#111;border:1px solid #2a2a2a;border-radius:12px;padding:20px;margin-bottom:20px">
+    <div style="color:#A78BFA;font-size:11px;font-weight:800;letter-spacing:1.5px;margin-bottom:12px">LICENCE TERMS</div>
+    <div style="color:#ddd;font-size:13px;line-height:1.6">
+      <div style="margin-bottom:10px"><strong style="color:white">Use rights:</strong> Commercial release, streaming, monetisation on Spotify / Apple Music / YouTube / SoundCloud and all DSPs.</div>
+      <div style="margin-bottom:10px"><strong style="color:white">Royalty split:</strong> """ + royalty_pct + """ to you (artist), the remainder to the producer.</div>
+      <div style="margin-bottom:10px"><strong style="color:white">Credit:</strong> You must credit the producer in track metadata (e.g. "Prod. by """ + safe_producer_name + """\").</div>
+      <div><strong style="color:white">Exclusivity:</strong> """ + exclusivity + """</div>
+    </div>
+  </div>
+
+  <div style="text-align:center;margin:24px 0">
+    <a href="https://beatfinder.co.uk" style="background:#C026D3;color:white;text-decoration:none;font-weight:800;font-size:14px;padding:12px 24px;border-radius:24px;display:inline-block">Re-download from BeatFinder</a>
+  </div>
+  <div style="color:#666;font-size:12px;text-align:center;margin-bottom:24px">You can re-download this beat anytime from your Profile → My Leases.</div>
+
+  <div style="border-top:1px solid #222;padding-top:16px;color:#555;font-size:11px;line-height:1.6">
+    This is your receipt — keep it for your records. The full licence agreement you accepted at checkout governs your use of this beat. Questions or disputes: trellitheproducer@gmail.com
+  </div>
+</div>
+"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": "Bearer " + RESEND_API_KEY,
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "from":    "BeatFinder <onboarding@resend.dev>",
+                    "to":      [to_email],
+                    "subject": "Receipt — " + safe_beat_title + " (" + tier_label + ")",
+                    "html":    html,
+                },
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print("[Email] Failed to send lease receipt: " + str(e))
+        return False
+
+
 def cloudinary_signature(params: dict) -> str:
     sorted_params = "&".join(
         k + "=" + str(v)
@@ -504,7 +594,12 @@ async def lease_webhook(request: Request):
 
     payload    = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
-    secret     = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    # Lease webhook has its own signing secret because it's a separate
+    # Stripe webhook endpoint (Connected accounts scope, while the main
+    # subscription webhook is in the platform-account scope). Fall back
+    # to STRIPE_WEBHOOK_SECRET only if the dedicated one isn't set, so
+    # legacy single-secret deployments keep working.
+    secret = os.getenv("STRIPE_LEASE_WEBHOOK_SECRET", "") or os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
     try:
         parts     = {p.split("=")[0]: p.split("=")[1] for p in sig_header.split(",")}
@@ -614,6 +709,32 @@ async def lease_webhook(request: Request):
                 print(f"[Lease] Premium sale voided {void_result.modified_count} prior basic lease(s) for beat {beat_id}")
 
         print(f"[Lease] Beat {beat_id} purchased ({tier}) by {buyer_email}")
+
+        # Send receipt + licence confirmation email to the buyer.
+        # Fire-and-forget — failure shouldn't block the webhook response
+        # to Stripe (which would cause Stripe to retry and double-count).
+        if buyer_email:
+            try:
+                # Compute price as float in GBP for the email
+                try:
+                    price_gbp = float(str(price).replace("£", "").replace("$", "").strip())
+                except Exception:
+                    price_gbp = 50.0 if tier == "basic" else 100.0
+                sent = await send_lease_receipt_email(
+                    to_email          = buyer_email,
+                    buyer_name        = buyer_name,
+                    beat_title        = beat.get("title", "Untitled Beat"),
+                    producer_name     = producer_name,
+                    producer_username = producer_username,
+                    price_gbp         = price_gbp,
+                    tier              = tier,
+                    beat_id           = str(beat_id),
+                )
+                print(f"[Lease] Receipt email to {buyer_email} sent={sent}")
+            except Exception as e:
+                # Log but don't fail the webhook — receipt is nice-to-have,
+                # the purchase has already been recorded successfully.
+                print(f"[Lease] Receipt email error: {e}")
 
     return {"received": True}
 
