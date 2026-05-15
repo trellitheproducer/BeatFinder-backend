@@ -375,6 +375,18 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     if tier not in ("basic", "premium"):
         raise HTTPException(status_code=400, detail="tier must be 'basic' or 'premium'")
 
+    # Premium leases are restricted to paid plans. Basic tier (£50) is
+    # open to all signed-in users including Free. Mirrors the frontend
+    # gate (sites 7745/8054/10123/11013 in BeatFinder.jsx) — backend
+    # check is defence-in-depth in case someone bypasses the UI.
+    if tier == "premium":
+        u_plan = (user.get("plan") or "free").lower()
+        if u_plan not in ("artist", "producer"):
+            raise HTTPException(
+                status_code=403,
+                detail="Premium leases require an Artist Pro or Producer Pro subscription"
+            )
+
     db   = request.app.state.db
     beat = await db.producer_beats.find_one({"_id": ObjectId(beat_id)})
 
@@ -416,7 +428,18 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     # Always look up the producer's current Stripe account from users collection
     producer_account = beat.get("stripe_account_id")
     if not producer_account:
-        producer_doc = await db.users.find_one({"_id": __import__("bson").ObjectId(beat.get("producer_id", ""))})
+        # Producer _id can be either a string (newer accounts) or ObjectId
+        # (legacy). Try string first; fall back to ObjectId. Without this,
+        # new producers couldn't sell beats — the lookup silently failed
+        # and the caller got "Producer has not connected their Stripe
+        # account yet" even when they had.
+        producer_id_raw = beat.get("producer_id", "")
+        producer_doc = await db.users.find_one({"_id": producer_id_raw}) if producer_id_raw else None
+        if not producer_doc and producer_id_raw:
+            try:
+                producer_doc = await db.users.find_one({"_id": ObjectId(producer_id_raw)})
+            except Exception:
+                producer_doc = None
         producer_account = producer_doc.get("stripe_account_id") if producer_doc else None
 
     if not producer_account:
