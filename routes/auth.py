@@ -55,18 +55,54 @@ async def _ensure_email_normalization_ready(db, app_state):
         if count:
             print(f"[Email norm] Backfilled {count} users")
 
-        # Non-unique index for fast lookups. We deliberately don't make
-        # this unique yet — there may be existing dupes (Harrison Hall
-        # + HMbarsdat case). The admin can clean those up via the
-        # admin Users panel; once dupes are gone, we'd separately
-        # convert this to a unique index. Until then: app-level checks
-        # in /register catch new dupes, and this index just makes the
-        # lookups fast.
+        # UNIQUE index for fast lookups AND database-level dedup protection.
+        # Migration order:
+        #   1. Check if a non-unique normalized_email index already exists
+        #      (from the previous deploy). If yes, drop it.
+        #   2. Create the new unique index.
+        # If unique creation fails (i.e. a duplicate slipped through that
+        # we don't know about), we re-create the non-unique index as a
+        # fallback so lookups stay fast — and log loudly so the admin
+        # knows to investigate.
         try:
-            await db.users.create_index("normalized_email")
-            print("[Email norm] Index ensured on users.normalized_email")
+            # Find any existing index on normalized_email
+            existing_indexes = await db.users.index_information()
+            existing_norm_idx_name = None
+            existing_was_unique    = False
+            for idx_name, idx_info in existing_indexes.items():
+                key = idx_info.get("key", [])
+                if len(key) == 1 and key[0][0] == "normalized_email":
+                    existing_norm_idx_name = idx_name
+                    existing_was_unique    = bool(idx_info.get("unique", False))
+                    break
+
+            if existing_norm_idx_name and not existing_was_unique:
+                # Non-unique index from previous deploy — drop it so we
+                # can replace with the unique version.
+                try:
+                    await db.users.drop_index(existing_norm_idx_name)
+                    print(f"[Email norm] Dropped non-unique index {existing_norm_idx_name}")
+                except Exception as drop_err:
+                    print(f"[Email norm] Could not drop old index: {drop_err}")
+
+            if existing_was_unique:
+                print("[Email norm] Unique index already present")
+            else:
+                try:
+                    await db.users.create_index("normalized_email", unique=True)
+                    print("[Email norm] UNIQUE index ensured on users.normalized_email")
+                except Exception as unique_err:
+                    # Most likely cause: a leftover duplicate that wasn't
+                    # cleaned up. Fall back to non-unique so app keeps
+                    # working, but log loudly.
+                    print(f"[Email norm] ⚠ UNIQUE index FAILED — duplicates may exist: {unique_err}")
+                    try:
+                        await db.users.create_index("normalized_email")
+                        print("[Email norm] Fell back to non-unique index")
+                    except Exception as fallback_err:
+                        print(f"[Email norm] Fallback index also failed: {fallback_err}")
         except Exception as e:
-            print(f"[Email norm] Could not create index: {e}")
+            print(f"[Email norm] Index management error: {e}")
     except Exception as e:
         # Don't break login/register if migration fails — log and move on.
         # The endpoints have a fallback to case-insensitive raw email lookup.
