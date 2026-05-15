@@ -14,6 +14,111 @@ from auth import hash_password, verify_password, create_token, get_current_user
 router = APIRouter()
 
 
+# ── Regex escape helper (used for case-insensitive email lookups) ──
+import re as _re
+def _re_escape(s: str) -> str:
+    return _re.escape(s or "")
+
+
+# ── Email-normalization migration state ──────────────────────────────
+# We backfill normalized_email for all existing users and create a
+# (non-unique) index on it the first time any auth endpoint runs after
+# deploy. Doing this lazily means we don't need to touch main.py or
+# wire it into the FastAPI lifespan event — it just happens silently
+# on first traffic post-deploy. The flag in app.state prevents the
+# work from running on every request.
+async def _ensure_email_normalization_ready(db, app_state):
+    """One-shot migration: backfill normalized_email + ensure index."""
+    if getattr(app_state, "_bf_email_norm_ready", False):
+        return
+    # Set flag immediately to avoid concurrent first-requests both running
+    # the migration. Worst case: two run in parallel and both no-op (the
+    # backfill query filters out already-normalized rows, and create_index
+    # is idempotent in Mongo).
+    app_state._bf_email_norm_ready = True
+    try:
+        # Backfill — only touches rows that don't already have a normalized_email
+        cursor = db.users.find(
+            {"normalized_email": {"$exists": False}},
+            {"_id": 1, "email": 1},
+        )
+        count = 0
+        async for u in cursor:
+            norm = normalize_email(u.get("email", ""))
+            if not norm:
+                continue
+            await db.users.update_one(
+                {"_id": u["_id"]},
+                {"$set": {"normalized_email": norm}},
+            )
+            count += 1
+        if count:
+            print(f"[Email norm] Backfilled {count} users")
+
+        # Non-unique index for fast lookups. We deliberately don't make
+        # this unique yet — there may be existing dupes (Harrison Hall
+        # + HMbarsdat case). The admin can clean those up via the
+        # admin Users panel; once dupes are gone, we'd separately
+        # convert this to a unique index. Until then: app-level checks
+        # in /register catch new dupes, and this index just makes the
+        # lookups fast.
+        try:
+            await db.users.create_index("normalized_email")
+            print("[Email norm] Index ensured on users.normalized_email")
+        except Exception as e:
+            print(f"[Email norm] Could not create index: {e}")
+    except Exception as e:
+        # Don't break login/register if migration fails — log and move on.
+        # The endpoints have a fallback to case-insensitive raw email lookup.
+        print(f"[Email norm] Migration error (non-fatal): {e}")
+
+
+# ── Email normalization ──────────────────────────────────────────────
+# Two emails that look different to a naive string compare can deliver
+# to the same inbox: "Foo@gmail.com" vs "foo@gmail.com" (case), or
+# "f.o.o@gmail.com" vs "foo@gmail.com" (Gmail strips dots), or
+# "foo+anything@gmail.com" vs "foo@gmail.com" (Gmail strips +aliases).
+#
+# Storing AND querying against a normalized form prevents accidental
+# duplicate accounts. We keep the user's original email too (for
+# display + sending mail) and add a `normalized_email` field that's
+# unique. Existing rows get backfilled lazily on startup.
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email for uniqueness checks.
+
+    Rules applied to every email:
+      • Lowercase the whole thing
+      • Strip surrounding whitespace
+
+    Additional rules for Gmail / Googlemail (and only those):
+      • Remove all dots from the local part
+      • Strip "+suffix" aliases
+
+    Returns "" if the input isn't a recognisable email — callers
+    should treat that as invalid and 400.
+    """
+    if not email or not isinstance(email, str):
+        return ""
+    s = email.strip().lower()
+    if "@" not in s:
+        return ""
+    local, _, domain = s.rpartition("@")
+    if not local or not domain:
+        return ""
+    # Gmail-specific tricks: dots in local part are ignored, and
+    # "+anything" is an alias to the same inbox. Googlemail.com is
+    # the same provider with a different domain name.
+    if domain in ("gmail.com", "googlemail.com"):
+        # Strip alias
+        if "+" in local:
+            local = local.split("+", 1)[0]
+        # Strip dots
+        local = local.replace(".", "")
+        # Normalize domain to gmail.com for both legacy variants
+        domain = "gmail.com"
+    return local + "@" + domain
+
+
 # ── Timestamp helper ─────────────────────────────────────────────────
 # All datetimes in MongoDB are stored naive-UTC (via datetime.utcnow()).
 # When we serialise them with .isoformat() the resulting string has NO
@@ -182,6 +287,8 @@ def _public(user: dict) -> dict:
 @router.post("/register", response_model=TokenResponse, status_code=201)
 async def register(body: RegisterRequest, request: Request):
     db = request.app.state.db
+    # Run one-time email-normalization migration if needed
+    await _ensure_email_normalization_ready(db, request.app.state)
 
     # Enforce server-side validation — frontend has the same checks but
     # API clients (or a malicious user bypassing the UI) could otherwise
@@ -194,20 +301,36 @@ async def register(body: RegisterRequest, request: Request):
         raise HTTPException(status_code=400, detail="Please provide a valid email address.")
     if not body.name or not body.name.strip():
         raise HTTPException(status_code=400, detail="Name is required.")
-    if await db.users.find_one({"email": body.email}):
+
+    # Normalize for uniqueness — this catches case differences AND
+    # Gmail dot/+ tricks. We check both the normalized field (new
+    # accounts) and the raw email (legacy accounts pre-normalization).
+    norm = normalize_email(body.email)
+    if not norm:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+    existing = await db.users.find_one({
+        "$or": [
+            {"normalized_email": norm},
+            {"email": {"$regex": "^" + _re_escape(body.email) + "$", "$options": "i"}},
+        ]
+    })
+    if existing:
+        # Don't reveal whether the existing one is deleted or active —
+        # tell the user clearly that this email is in use.
         raise HTTPException(status_code=409, detail="Email already registered")
 
     user_id = str(ObjectId())
     user = {
-        "_id":        user_id,
-        "name":       body.name,
-        "email":      body.email,
-        "password":   hash_password(body.password),
-        "plan":       "free",
-        "is_admin":   False,
-        "bio":        "",
-        "location":   "",
-        "created_at": datetime.utcnow(),
+        "_id":              user_id,
+        "name":             body.name,
+        "email":            body.email,
+        "normalized_email": norm,
+        "password":         hash_password(body.password),
+        "plan":             "free",
+        "is_admin":         False,
+        "bio":              "",
+        "location":         "",
+        "created_at":       datetime.utcnow(),
     }
     await db.users.insert_one(user)
     token = create_token(user_id, body.email)
@@ -218,7 +341,19 @@ async def register(body: RegisterRequest, request: Request):
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request):
     db   = request.app.state.db
-    user = await db.users.find_one({"email": body.email})
+    # Run one-time email-normalization migration if needed
+    await _ensure_email_normalization_ready(db, request.app.state)
+    # Allow users to log in regardless of email casing or Gmail
+    # dot/+ variations. Try normalized first; fall back to a
+    # case-insensitive exact match for legacy rows pre-backfill.
+    norm = normalize_email(body.email)
+    user = None
+    if norm:
+        user = await db.users.find_one({"normalized_email": norm})
+    if not user and body.email:
+        user = await db.users.find_one({
+            "email": {"$regex": "^" + _re_escape(body.email) + "$", "$options": "i"}
+        })
     if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token(str(user["_id"]), user["email"])
@@ -1357,7 +1492,17 @@ class ResetPasswordRequest(BaseModel):
 @router.post("/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest, request: Request):
     db       = request.app.state.db
-    user_doc = await db.users.find_one({"email": body.email.lower().strip()})
+    # Run one-time email-normalization migration if needed
+    await _ensure_email_normalization_ready(db, request.app.state)
+    # Try normalized lookup first (Gmail tricks + case insensitive),
+    # fall back to legacy lowercased exact match for users not yet
+    # backfilled.
+    norm = normalize_email(body.email)
+    user_doc = None
+    if norm:
+        user_doc = await db.users.find_one({"normalized_email": norm})
+    if not user_doc:
+        user_doc = await db.users.find_one({"email": (body.email or "").lower().strip()})
     if not user_doc:
         return {"success": True, "message": "If that email exists you will receive a reset link."}
 
@@ -2061,13 +2206,19 @@ async def admin_list_users(
     skip: int = 0,
     limit: int = 20,
     q: str = "",
+    include_deleted: bool = False,
+    filter_by: str = "",
 ):
     """Paginated list of all users for the admin dashboard.
 
     Query params:
-      • skip  — pagination offset (default 0)
-      • limit — page size, capped at 100 (default 20)
-      • q     — optional case-insensitive search across username + email
+      • skip            — pagination offset (default 0)
+      • limit           — page size, capped at 100 (default 20)
+      • q               — case-insensitive search across username/email/name
+      • include_deleted — if true, include soft-deleted accounts (default false)
+      • filter_by       — narrow further. One of: "" (all), "active",
+                          "lifetime", "free", "admin", "payment_failing".
+                          "deleted" only matters when include_deleted=true.
 
     Returns total count + a page of user summaries. Sensitive fields
     (password, password_resets) are stripped. Lifetime accounts have
@@ -2081,15 +2232,60 @@ async def admin_list_users(
     skip  = max(0, int(skip or 0))
 
     # Build filter — empty q = all users
-    mongo_filter = {}
+    and_clauses = []
+
+    # Search
     qstr = (q or "").strip()
     if qstr:
         pattern = {"$regex": qstr, "$options": "i"}
-        mongo_filter = {"$or": [
+        and_clauses.append({"$or": [
             {"username": pattern},
             {"email":    pattern},
             {"name":     pattern},
-        ]}
+        ]})
+
+    # Hide deleted by default
+    if not include_deleted:
+        and_clauses.append({"$or": [
+            {"deleted": {"$exists": False}},
+            {"deleted": False},
+        ]})
+
+    # Filter chips
+    fb = (filter_by or "").strip().lower()
+    if fb == "active":
+        and_clauses.append({"subscriptionActive": True})
+    elif fb == "free":
+        # No active subscription AND not a hardcoded lifetime account
+        and_clauses.append({"$or": [
+            {"subscriptionActive": {"$exists": False}},
+            {"subscriptionActive": False},
+        ]})
+    elif fb == "admin":
+        and_clauses.append({"is_admin": True})
+    elif fb == "payment_failing":
+        and_clauses.append({"payment_failing": True})
+    elif fb == "deleted":
+        # Show ONLY deleted (overrides include_deleted gate)
+        and_clauses = [c for c in and_clauses if "deleted" not in str(c)]
+        and_clauses.append({"deleted": True})
+    # "lifetime" filter handled post-fetch since it requires checking
+    # the LIFETIME_ACCOUNTS hardcoded list + db.lifetime_accounts.
+
+    mongo_filter = {"$and": and_clauses} if and_clauses else {}
+
+    # For "lifetime" filter we have to fetch eligible usernames from both
+    # the hardcoded dict AND db.lifetime_accounts, then constrain by them.
+    if fb == "lifetime":
+        db_lifetime_usernames = [d["_id"] for d in await db.lifetime_accounts.find({}, {"_id": 1}).to_list(500)]
+        hardcoded = list(LIFETIME_ACCOUNTS.keys())
+        all_lifetime = list(set(db_lifetime_usernames + hardcoded))
+        if all_lifetime:
+            and_clauses.append({"username": {"$in": all_lifetime}})
+            mongo_filter = {"$and": and_clauses}
+        else:
+            # Empty result if no lifetime accounts exist at all
+            return {"total": 0, "skip": skip, "limit": limit, "users": []}
 
     total = await db.users.count_documents(mongo_filter)
 
@@ -2128,6 +2324,7 @@ async def admin_list_users(
             "subscription_active": bool(u.get("subscriptionActive", False)) or is_lifetime,
             "billing_interval":    "lifetime" if is_lifetime else u.get("billing_interval", ""),
             "payment_failing":     bool(u.get("payment_failing", False)),
+            "deleted":             bool(u.get("deleted", False)),
             "created_at":          created_iso,
             "stripe_customer_id":  u.get("stripe_customer_id", "") or "",
         }
@@ -2137,4 +2334,121 @@ async def admin_list_users(
         "skip":   skip,
         "limit":  limit,
         "users":  [_row(u) for u in docs],
+    }
+
+
+@router.post("/admin/users/{user_id}/delete")
+async def admin_delete_user(
+    user_id: str,
+    request: Request,
+    admin=Depends(get_admin_user),
+):
+    """Soft-delete a user account as an admin action.
+
+    Mirrors /delete-my-account: anonymises the user row (clears PII,
+    sets `deleted: True`), hides their beats, removes lyrics/agreements,
+    keeps lease records for legal retention. Records who performed the
+    deletion + when, so we have an audit trail.
+
+    Safety rails:
+      • Cannot delete yourself (force you to use the self-delete flow,
+        which has email-confirm protection)
+      • Cannot delete the hardcoded LIFETIME_ACCOUNTS (Trelli/Mikez/
+        HMbarsdat) — those are protected. Use revoke-lifetime first
+        if you need to remove a permanent admin.
+      • Already-deleted users return success (idempotent — re-deleting
+        is a no-op, but we don't error)
+    """
+    from db_helpers import find_user_by_id, update_user_by_id
+
+    target = await find_user_by_id(request.app.state.db, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Don't allow deleting yourself via the admin path
+    if str(target.get("_id", "")) == str(admin.get("_id", "")):
+        raise HTTPException(
+            status_code=400,
+            detail="You can't delete yourself from the admin panel. Use Profile → Settings → Delete Account.",
+        )
+
+    # Don't allow deleting hardcoded permanent accounts
+    target_username = (target.get("username") or "").strip()
+    if target_username in LIFETIME_ACCOUNTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"@{target_username} is a permanent lifetime account and can't be deleted from here.",
+        )
+
+    # Idempotent: if already deleted, just return success
+    if target.get("deleted"):
+        return {
+            "success": True,
+            "already_deleted": True,
+            "message": "Account was already deleted.",
+        }
+
+    db   = request.app.state.db
+    uid  = target["_id"]
+    uid_str = str(uid)
+    now  = datetime.utcnow()
+    anon_email    = f"deleted-{uid_str}@deleted.beatfinder.invalid"
+    anon_username = f"deleted_user_{uid_str[:8]}"
+
+    await update_user_by_id(db, uid, {
+        "$set": {
+            "deleted":               True,
+            "deleted_at":            now,
+            "deletion_reason":       f"admin-removed by @{admin.get('username','admin')}",
+            "deleted_by":            admin.get("username", ""),
+            "email":                 anon_email,
+            "username":              anon_username,
+            "name":                  "Deleted user",
+            "bio":                   "",
+            "location":              "",
+            "instagram":             "",
+            "tiktok":                "",
+            "youtube":               "",
+            "spotify":               "",
+            "website":               "",
+            "avatarUrl":             "",
+            "headerUrl":             "",
+            "appleMusic":            "",
+            "stripe_customer_id":    "",
+            "subscription_expires_at": None,
+            "plan":                  "free",
+            "subscriptionActive":    False,
+        },
+        "$unset": {
+            "password":        "",
+            "hashed_password": "",
+        },
+    })
+
+    # Hide their uploaded beats from public visibility
+    if "beats" in await db.list_collection_names():
+        await db.beats.update_many(
+            {"producer_id": uid_str},
+            {"$set": {"deleted": True, "deleted_at": now, "hidden": True}},
+        )
+    if "producer_beats" in await db.list_collection_names():
+        await db.producer_beats.update_many(
+            {"producer_id": uid_str},
+            {"$set": {"deleted": True, "deleted_at": now, "hidden": True}},
+        )
+
+    # Soft-delete personal items
+    if "lyrics" in await db.list_collection_names():
+        await db.lyrics.delete_many({"user_id": uid_str})
+    if "free_licence_agreements" in await db.list_collection_names():
+        await db.free_licence_agreements.delete_many({"user_id": uid_str})
+
+    # If they were granted lifetime via the admin panel, remove it
+    if "lifetime_accounts" in await db.list_collection_names():
+        await db.lifetime_accounts.delete_one({"_id": target_username})
+
+    return {
+        "success": True,
+        "deleted_at": now.isoformat(),
+        "anon_username": anon_username,
     }
