@@ -178,6 +178,80 @@ async def create_checkout(
     return {"checkout_url": session["url"]}
 
 
+# ── Customer Portal ───────────────────────────────────────────────────────────
+# Opens Stripe's hosted Customer Portal so subscribers can self-serve:
+#   • Cancel their subscription
+#   • Update card / payment method
+#   • Download invoices
+#   • View billing history
+# Saves us from having to build and maintain any of those screens ourselves,
+# and means we get fewer "please cancel my account" support emails.
+
+@router.post("/customer-portal")
+async def create_customer_portal(
+    request: Request,
+    user=Depends(get_current_user),
+):
+    """Returns a one-time portal URL the frontend redirects to."""
+    customer_id = user.get("stripe_customer_id", "")
+
+    # If we don't have a customer ID stored, try to find one by looking up
+    # the customer by email on Stripe. This covers the gap for users whose
+    # subscription was created before we started storing customer_id on
+    # the webhook (see plan_fields update).
+    if not customer_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                lookup = await client.get(
+                    "https://api.stripe.com/v1/customers",
+                    auth=(STRIPE_SECRET, ""),
+                    params={"email": user.get("email", ""), "limit": 1},
+                )
+                lookup_data = lookup.json()
+                items = lookup_data.get("data", [])
+                if items:
+                    customer_id = items[0].get("id", "")
+                    # Backfill onto the user record so we don't have to do
+                    # this Stripe API lookup on every portal open.
+                    if customer_id:
+                        db = request.app.state.db
+                        await db.users.update_one(
+                            {"_id": user["_id"]},
+                            {"$set": {"stripe_customer_id": customer_id}},
+                        )
+        except Exception as e:
+            print("[Stripe] customer lookup by email failed: " + str(e))
+
+    if not customer_id:
+        # User has no Stripe customer record — they've never subscribed.
+        # Return a friendly error the frontend can show.
+        raise HTTPException(
+            status_code=400,
+            detail="No subscription found on your account. Upgrade to a paid plan first."
+        )
+
+    # Create the portal session. Stripe gives us a one-time URL that
+    # expires after a few minutes — frontend should redirect immediately.
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            "https://api.stripe.com/v1/billing_portal/sessions",
+            auth=(STRIPE_SECRET, ""),
+            data={
+                "customer":   customer_id,
+                "return_url": FRONTEND_URL + "?portal=closed",
+            },
+        )
+        if r.status_code >= 400:
+            print("[Stripe] portal session creation failed: " + r.text)
+            raise HTTPException(
+                status_code=502,
+                detail="Couldn't open subscription management. Please try again or contact support.",
+            )
+        session = r.json()
+
+    return {"portal_url": session.get("url")}
+
+
 # ── Stripe Webhook ────────────────────────────────────────────────────────────
 
 @router.post("/webhook")
@@ -225,6 +299,11 @@ async def stripe_webhook(request: Request):
         billing       = metadata.get("billing", "monthly")
         period_end_ts = None
         sub_id        = session.get("subscription")
+        # Capture the Stripe customer ID so we can later open the Customer
+        # Portal for this user (cancel sub / update card / view invoices).
+        # checkout.session.completed has `customer` on the session itself;
+        # invoice.payment_succeeded has it on the invoice.
+        customer_id   = session.get("customer", "")
 
         # For invoice events, look up the subscription to get metadata + period_end
         if sub_id:
@@ -244,6 +323,8 @@ async def stripe_webhook(request: Request):
                         user_email = sub_data.get("customer_email", "")
                     if not user_name:
                         user_name  = sub_data.get("metadata", {}).get("user_name", "")
+                    if not customer_id:
+                        customer_id = sub_data.get("customer", "")
             except Exception as e:
                 print("[Stripe] Could not fetch subscription: " + str(e))
 
@@ -262,8 +343,12 @@ async def stripe_webhook(request: Request):
             "upgraded_at":             datetime.utcnow(),
             "billing_interval":        billing,
             "stripe_subscription_id":  sub_id,
-            "subscription_expires_at": expires_dt,   # ← new
+            "subscription_expires_at": expires_dt,
         }
+        # Only set customer_id if we actually have one — avoid wiping a
+        # previously-stored value with an empty string on a re-fire.
+        if customer_id:
+            plan_fields["stripe_customer_id"] = customer_id
 
         result = await db.users.update_one(
             {"email": user_email},
