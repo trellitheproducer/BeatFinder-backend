@@ -41,18 +41,35 @@ PLANS = {
 }
 
 
+# ── Lifetime accounts — never expire ──────────────────────────────────
+# Single source of truth for who gets a permanent paid plan + admin flag.
+# Used by _public(), /profile/{username}, /profile-auth/{username},
+# /subscription-status, and anywhere else that needs to know whether a
+# user is on a lifetime plan. Adding a new lifetime user = add them here
+# and they'll show as Pro everywhere automatically (badges, ticks, plan
+# tags, gated features).
+LIFETIME_ACCOUNTS = {
+    "Trelli":     {"plan": "producer", "is_admin": True},
+    "Mikez":      {"plan": "artist",   "is_admin": False},
+    "HMbarsdat":  {"plan": "artist",   "is_admin": False},
+}
+
+
+def _lifetime_config(username: str):
+    """Return the lifetime config dict for the given username, or None
+    if the user isn't on a lifetime plan. Case-sensitive — usernames
+    must match exactly as keyed in LIFETIME_ACCOUNTS."""
+    if not username:
+        return None
+    return LIFETIME_ACCOUNTS.get(username)
+
+
 def _public(user: dict) -> dict:
     from datetime import timezone
 
-    # ── Lifetime accounts — never expire ──────────────────────────────
-    LIFETIME_ACCOUNTS = {
-        "Trelli":     {"plan": "producer", "is_admin": True},
-        "Mikez":      {"plan": "artist",   "is_admin": False},
-        "HMbarsdat":  {"plan": "artist",   "is_admin": False},
-    }
     username = user.get("username", "")
-    if username in LIFETIME_ACCOUNTS:
-        cfg = LIFETIME_ACCOUNTS[username]
+    cfg = _lifetime_config(username)
+    if cfg:
         return {
             "id":                    str(user["_id"]),
             "name":                  user.get("name", ""),
@@ -506,10 +523,17 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
     play_count  = sum(b.get("playCount", 0) for b in beats)
     track_count = await db.artist_tracks.count_documents({"artist_id": user_id})
 
+    # Lifetime accounts override the stored plan value — without this,
+    # a user who got marked lifetime in the LIFETIME_ACCOUNTS dict but
+    # still has plan:"free" in the DB shows as a free account on their
+    # public profile (no Pro tick, no plan chip).
+    lifetime_cfg = _lifetime_config(user.get("username", ""))
+    effective_plan = lifetime_cfg["plan"] if lifetime_cfg else user.get("plan", "free")
+
     return {
         "username":       user.get("username"),
         "name":           user.get("name"),
-        "plan":           user.get("plan", "free"),
+        "plan":           effective_plan,
         "bio":            user.get("bio", ""),
         "location":       user.get("location", ""),
         "instagram":      user.get("instagram", ""),
@@ -558,14 +582,12 @@ async def get_public_profile(username: str, request: Request, _user: str = ""):
 # ── Subscription status (called after Stripe redirect + on app load) ─
 @router.get("/subscription-status")
 async def subscription_status(request: Request, user=Depends(get_current_user)):
-    # Lifetime accounts — never auto-downgrade
-    LIFETIME = {
-        "Trelli": "producer",
-        "Mikez":  "artist",
-    }
-    if user.get("username") in LIFETIME:
+    # Lifetime accounts — never auto-downgrade. Uses module-level
+    # LIFETIME_ACCOUNTS as the single source of truth.
+    cfg = _lifetime_config(user.get("username", ""))
+    if cfg:
         return {
-            "plan":                  LIFETIME[user.get("username")],
+            "plan":                  cfg["plan"],
             "subscriptionActive":    True,
             "subscriptionExpiresAt": None,
             "billingInterval":       "lifetime",
@@ -635,21 +657,31 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
     play_count  = sum(b.get("playCount", 0) for b in beats)
     track_count = await db.artist_tracks.count_documents({"artist_id": user_id})
 
-    expires_at = user.get("subscription_expires_at")
-    sub_active = False
-    if expires_at and user.get("plan", "free") != "free":
-        if isinstance(expires_at, datetime):
-            sub_active = expires_at > datetime.utcnow()
-        else:
-            try:
-                sub_active = float(expires_at) > datetime.utcnow().timestamp()
-            except Exception:
-                sub_active = False
+    # Lifetime accounts: override the plan + force subscriptionActive=true
+    # regardless of any stored subscription_expires_at. Without this they
+    # display as Free on their public profile (no Pro tick / no plan chip).
+    lifetime_cfg = _lifetime_config(user.get("username", ""))
+    if lifetime_cfg:
+        effective_plan = lifetime_cfg["plan"]
+        sub_active     = True
+        expires_at     = None
+    else:
+        effective_plan = user.get("plan", "free")
+        expires_at = user.get("subscription_expires_at")
+        sub_active = False
+        if expires_at and effective_plan != "free":
+            if isinstance(expires_at, datetime):
+                sub_active = expires_at > datetime.utcnow()
+            else:
+                try:
+                    sub_active = float(expires_at) > datetime.utcnow().timestamp()
+                except Exception:
+                    sub_active = False
 
     return {
         "username":              user.get("username"),
         "name":                  user.get("name"),
-        "plan":                  user.get("plan", "free"),
+        "plan":                  effective_plan,
         "bio":                   user.get("bio", ""),
         "location":              user.get("location", ""),
         "instagram":             user.get("instagram", ""),
