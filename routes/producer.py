@@ -518,18 +518,12 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     # Always look up the producer's current Stripe account from users collection
     producer_account = beat.get("stripe_account_id")
     if not producer_account:
-        # Producer _id can be either a string (newer accounts) or ObjectId
-        # (legacy). Try string first; fall back to ObjectId. Without this,
-        # new producers couldn't sell beats — the lookup silently failed
-        # and the caller got "Producer has not connected their Stripe
-        # account yet" even when they had.
-        producer_id_raw = beat.get("producer_id", "")
-        producer_doc = await db.users.find_one({"_id": producer_id_raw}) if producer_id_raw else None
-        if not producer_doc and producer_id_raw:
-            try:
-                producer_doc = await db.users.find_one({"_id": ObjectId(producer_id_raw)})
-            except Exception:
-                producer_doc = None
+        # find_user_by_id handles both string + ObjectId _id formats.
+        # Without this both-format handling, new producers couldn't sell
+        # beats — the lookup silently failed and the caller got "Producer
+        # has not connected their Stripe account yet" even when they had.
+        from db_helpers import find_user_by_id
+        producer_doc = await find_user_by_id(db, beat.get("producer_id", ""))
         producer_account = producer_doc.get("stripe_account_id") if producer_doc else None
 
     if not producer_account:
