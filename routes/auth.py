@@ -103,6 +103,16 @@ async def _ensure_email_normalization_ready(db, app_state):
                         print(f"[Email norm] Fallback index also failed: {fallback_err}")
         except Exception as e:
             print(f"[Email norm] Index management error: {e}")
+
+        # ── Presence index (last_seen_at) ─────────────────────────
+        # Used by admin Users panel filters + future "who's online now"
+        # queries. Non-unique. Idempotent — create_index is safe to
+        # call repeatedly.
+        try:
+            await db.users.create_index("last_seen_at")
+            print("[Presence] Index ensured on users.last_seen_at")
+        except Exception as e:
+            print(f"[Presence] Could not create last_seen_at index: {e}")
     except Exception as e:
         # Don't break login/register if migration fails — log and move on.
         # The endpoints have a fallback to case-insensitive raw email lookup.
@@ -243,6 +253,20 @@ async def _lifetime_config_async(db, username: str):
 def _public(user: dict) -> dict:
     from datetime import timezone
 
+    # ── Online status ────────────────────────────────────────────
+    # "Online" = last_seen_at within the last 2 minutes. We compute
+    # it here so every endpoint that calls _public gets it for free.
+    # last_seen_at is stored in MongoDB as a naive UTC datetime and
+    # updated by /heartbeat at ~60s intervals from the frontend.
+    online_window_seconds = 120
+    last_seen = user.get("last_seen_at")
+    is_online = False
+    last_seen_iso = ""
+    if isinstance(last_seen, datetime):
+        delta = (datetime.utcnow() - last_seen).total_seconds()
+        is_online = 0 <= delta <= online_window_seconds
+        last_seen_iso = _iso_utc(last_seen)
+
     username = user.get("username", "")
     # Prefer an override injected by the async endpoint (which has access
     # to db.lifetime_accounts). Falls back to the synchronous hardcoded
@@ -275,6 +299,8 @@ def _public(user: dict) -> dict:
             "billingInterval":       "lifetime",
             "terms_accepted_version": user.get("terms_accepted_version", ""),
             "beatArtworkUrl":         user.get("beatArtworkUrl", ""),
+            "is_online":              is_online,
+            "last_seen_at":           last_seen_iso,
         }
 
     expires_at = user.get("subscription_expires_at")
@@ -316,6 +342,8 @@ def _public(user: dict) -> dict:
         "billingInterval":       user.get("billing_interval", "monthly"),
         "terms_accepted_version": user.get("terms_accepted_version", ""),
         "beatArtworkUrl":         user.get("beatArtworkUrl", ""),
+        "is_online":              is_online,
+        "last_seen_at":           last_seen_iso,
     }
 
 
@@ -405,6 +433,23 @@ async def me(request: Request, user=Depends(get_current_user)):
     db = request.app.state.db
     user["__lifetime_override__"] = await _lifetime_config_async(db, user.get("username", ""))
     return _public(user)
+
+
+# ── Heartbeat (presence) ─────────────────────────────────────────
+# Frontend pings this every ~60s while the app is open and visible.
+# We update last_seen_at on the user row; other endpoints compute
+# is_online from that timestamp via _public(). Fire-and-forget on
+# the client side — failures are not surfaced to the user.
+@router.post("/heartbeat")
+async def heartbeat(request: Request, user=Depends(get_current_user)):
+    from db_helpers import update_user_by_id
+    db = request.app.state.db
+    # Touch the timestamp. Deliberately bypass other validation —
+    # this is the hottest auth endpoint in the app, runs constantly.
+    await update_user_by_id(db, user["_id"], {
+        "$set": {"last_seen_at": datetime.utcnow()},
+    })
+    return {"ok": True}
 
 
 # ── Accept Terms & Conditions ────────────────────────────────────
@@ -728,12 +773,18 @@ async def search_users(q: str, request: Request):
              "is_admin": bool(db_lifetime_map[uname].get("is_admin", False))}
             if uname in db_lifetime_map else None
         )
+        # Online status from last_seen_at — same 2-min window as _public()
+        is_online = False
+        last_seen = d.get("last_seen_at")
+        if isinstance(last_seen, datetime):
+            is_online = 0 <= (datetime.utcnow() - last_seen).total_seconds() <= 120
         return {
             "username":  uname,
             "name":      d.get("name", ""),
             "plan":      cfg["plan"] if cfg else d.get("plan", "free"),
             "bio":       d.get("bio", ""),
             "avatarUrl": d.get("avatarUrl", ""),
+            "is_online": is_online,
         }
     return [_row(d) for d in docs if d.get("username")]
 
@@ -994,11 +1045,16 @@ async def get_followers(username: str, request: Request):
             {"plan": db_lifetime_map[uname].get("plan", "artist")}
             if uname in db_lifetime_map else None
         )
+        is_online = False
+        last_seen = u.get("last_seen_at")
+        if isinstance(last_seen, datetime):
+            is_online = 0 <= (datetime.utcnow() - last_seen).total_seconds() <= 120
         return {
             "username":  uname,
             "name":      u.get("name", ""),
             "avatarUrl": u.get("avatarUrl", ""),
             "plan":      cfg["plan"] if cfg else u.get("plan", "free"),
+            "is_online": is_online,
         }
     return [_row(u) for u in users]
 
@@ -1025,11 +1081,16 @@ async def get_following(username: str, request: Request):
             {"plan": db_lifetime_map[uname].get("plan", "artist")}
             if uname in db_lifetime_map else None
         )
+        is_online = False
+        last_seen = u.get("last_seen_at")
+        if isinstance(last_seen, datetime):
+            is_online = 0 <= (datetime.utcnow() - last_seen).total_seconds() <= 120
         return {
             "username":  uname,
             "name":      u.get("name", ""),
             "avatarUrl": u.get("avatarUrl", ""),
             "plan":      cfg["plan"] if cfg else u.get("plan", "free"),
+            "is_online": is_online,
         }
     return [_row(u) for u in users]
 
@@ -2301,6 +2362,11 @@ async def admin_list_users(
         and_clauses.append({"is_admin": True})
     elif fb == "payment_failing":
         and_clauses.append({"payment_failing": True})
+    elif fb == "online":
+        # Active in the last 2 minutes (matches the OnlineDot window)
+        from datetime import timedelta
+        threshold = datetime.utcnow() - timedelta(seconds=120)
+        and_clauses.append({"last_seen_at": {"$gte": threshold}})
     elif fb == "deleted":
         # Show ONLY deleted (overrides include_deleted gate)
         and_clauses = [c for c in and_clauses if "deleted" not in str(c)]
@@ -2362,6 +2428,8 @@ async def admin_list_users(
             "payment_failing":     bool(u.get("payment_failing", False)),
             "deleted":             bool(u.get("deleted", False)),
             "created_at":          created_iso,
+            "last_seen_at":        _iso_utc(u.get("last_seen_at")) if u.get("last_seen_at") else "",
+            "is_online":           (lambda ls: isinstance(ls, datetime) and 0 <= (datetime.utcnow() - ls).total_seconds() <= 120)(u.get("last_seen_at")),
             "stripe_customer_id":  u.get("stripe_customer_id", "") or "",
         }
 
