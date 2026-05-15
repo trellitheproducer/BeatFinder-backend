@@ -622,6 +622,15 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "following_id": user_id,
     }) is not None
 
+    # Check the reverse: does this profile follow the current user
+    # back? Needed for the "mutual follow only" gate on the public
+    # profile's Message button — DMs are only allowed between users
+    # who follow each other both ways.
+    is_followed_by = await db.follows.find_one({
+        "follower_id":  user_id,
+        "following_id": str(current_user["_id"]),
+    }) is not None
+
     play_count  = sum(b.get("playCount", 0) for b in beats)
     track_count = await db.artist_tracks.count_documents({"artist_id": user_id})
 
@@ -660,6 +669,7 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
         "subscriptionExpiresAt": expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None),
         "billingInterval":       user.get("billing_interval", "monthly"),
         "isFollowing":           is_following,
+        "isFollowedBy":          is_followed_by,
         "beats": [
             {
                 "id":                str(b["_id"]),
@@ -769,6 +779,26 @@ async def follow_user(username: str, request: Request, user=Depends(get_current_
         }},
         upsert=True,
     )
+
+    # Auto-accept any pending DM thread from the user we just
+    # followed. Instagram pattern: following someone implicitly
+    # accepts them into your DMs. Without this, you'd follow someone
+    # back and their message would still sit in Requests, requiring
+    # a second tap. The thread doc lives in db.message_threads and
+    # is keyed by alphabetically-sorted pair.
+    me_name     = user.get("username", "")
+    target_name = target.get("username", "")
+    if me_name and target_name:
+        thread_id = ":".join(sorted([me_name, target_name]))
+        await db.message_threads.update_one(
+            {"_id": thread_id},
+            {
+                "$setOnInsert": {"users": sorted([me_name, target_name])},
+                "$addToSet":    {"accepted_by": me_name},
+            },
+            upsert=True,
+        )
+
     return {"success": True, "following": True}
 
 
