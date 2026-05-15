@@ -113,6 +113,25 @@ async def _ensure_email_normalization_ready(db, app_state):
             print("[Presence] Index ensured on users.last_seen_at")
         except Exception as e:
             print(f"[Presence] Could not create last_seen_at index: {e}")
+
+        # ── One-off admin-flag correction ─────────────────────────
+        # Legacy: some lifetime accounts had `is_admin: True` set on their
+        # MongoDB user doc directly (before LIFETIME_ACCOUNTS existed as
+        # the source of truth). The admin Users panel reads OR of both
+        # sources so those leftovers still show up as ADMIN. Fix: walk
+        # the LIFETIME_ACCOUNTS dict and force the DB flag to match.
+        # Idempotent — runs once per process, then short-circuits.
+        try:
+            for uname, cfg in LIFETIME_ACCOUNTS.items():
+                expected = bool(cfg.get("is_admin", False))
+                result = await db.users.update_one(
+                    {"username": uname, "is_admin": {"$ne": expected}},
+                    {"$set": {"is_admin": expected}},
+                )
+                if result.modified_count > 0:
+                    print(f"[Admin flag] Corrected @{uname} → is_admin={expected}")
+        except Exception as e:
+            print(f"[Admin flag] Correction error (non-fatal): {e}")
     except Exception as e:
         # Don't break login/register if migration fails — log and move on.
         # The endpoints have a fallback to case-insensitive raw email lookup.
