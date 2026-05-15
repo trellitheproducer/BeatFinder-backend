@@ -2052,3 +2052,89 @@ async def admin_list_lifetimes(
         for uname, cfg in LIFETIME_ACCOUNTS.items()
     ]
     return {"granted": granted, "permanent": permanent}
+
+
+@router.get("/admin/users")
+async def admin_list_users(
+    request: Request,
+    admin=Depends(get_admin_user),
+    skip: int = 0,
+    limit: int = 20,
+    q: str = "",
+):
+    """Paginated list of all users for the admin dashboard.
+
+    Query params:
+      • skip  — pagination offset (default 0)
+      • limit — page size, capped at 100 (default 20)
+      • q     — optional case-insensitive search across username + email
+
+    Returns total count + a page of user summaries. Sensitive fields
+    (password, password_resets) are stripped. Lifetime accounts have
+    their plan label corrected on the way out so the UI shows the
+    effective plan, not the stored one.
+    """
+    db = request.app.state.db
+
+    # Cap limit to avoid heavy queries
+    limit = max(1, min(int(limit or 20), 100))
+    skip  = max(0, int(skip or 0))
+
+    # Build filter — empty q = all users
+    mongo_filter = {}
+    qstr = (q or "").strip()
+    if qstr:
+        pattern = {"$regex": qstr, "$options": "i"}
+        mongo_filter = {"$or": [
+            {"username": pattern},
+            {"email":    pattern},
+            {"name":     pattern},
+        ]}
+
+    total = await db.users.count_documents(mongo_filter)
+
+    docs = await db.users.find(
+        mongo_filter,
+        # Project away the password hash + anything else sensitive.
+        # _id is included by default.
+        {"password": 0, "password_resets": 0},
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    # Batch-fetch DB-granted lifetime accounts so we can flag them
+    db_lifetime_docs = await db.lifetime_accounts.find({}).to_list(500)
+    db_lifetime_map  = {d["_id"]: d for d in db_lifetime_docs}
+
+    def _row(u):
+        uname = u.get("username", "")
+        # Compute effective plan (lifetime overrides stored plan)
+        cfg = LIFETIME_ACCOUNTS.get(uname) or (
+            {"plan": db_lifetime_map[uname].get("plan", "artist"),
+             "is_admin": bool(db_lifetime_map[uname].get("is_admin", False))}
+            if uname in db_lifetime_map else None
+        )
+        effective_plan = cfg["plan"] if cfg else u.get("plan", "free")
+        is_lifetime    = cfg is not None
+        created_at     = u.get("created_at")
+        created_iso    = created_at.isoformat() if hasattr(created_at, "isoformat") else (str(created_at) if created_at else "")
+        return {
+            "id":                  str(u.get("_id", "")),
+            "username":            uname,
+            "name":                u.get("name", ""),
+            "email":               u.get("email", ""),
+            "avatarUrl":           u.get("avatarUrl", ""),
+            "plan":                effective_plan,
+            "is_lifetime":         is_lifetime,
+            "is_admin":            bool(u.get("is_admin", False)) or bool(cfg and cfg.get("is_admin", False)),
+            "subscription_active": bool(u.get("subscriptionActive", False)) or is_lifetime,
+            "billing_interval":    "lifetime" if is_lifetime else u.get("billing_interval", ""),
+            "payment_failing":     bool(u.get("payment_failing", False)),
+            "created_at":          created_iso,
+            "stripe_customer_id":  u.get("stripe_customer_id", "") or "",
+        }
+
+    return {
+        "total":  total,
+        "skip":   skip,
+        "limit":  limit,
+        "users":  [_row(u) for u in docs],
+    }
