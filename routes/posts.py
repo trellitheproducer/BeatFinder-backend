@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 import os, httpx, hashlib, time as _time, html as _html_lib, re
 
-from auth import get_current_user, get_admin_user
+from auth import get_current_user, get_admin_user, get_effective_plan
 from routes.notifications import create_notification
 from routes.follower_notify import notify_post_to_followers
 
@@ -554,7 +554,10 @@ async def get_profile_posts(username: str, type: str = "status", request: Reques
 
 @router.post("/status", status_code=201)
 async def create_status(request: Request, user=Depends(get_current_user)):
-    if user.get("plan") not in ("artist", "producer"):
+    db = request.app.state.db
+    # Use effective plan (applies lifetime override) so granted-lifetime
+    # users can post. Reading user["plan"] directly would miss them.
+    if await get_effective_plan(db, user) not in ("artist", "producer"):
         raise HTTPException(status_code=403, detail="Pro plan required")
 
     form = await request.form()
@@ -748,7 +751,8 @@ class MusicPostBody(BaseModel):
 
 @router.post("/music", status_code=201)
 async def create_music_post(body: MusicPostBody, request: Request, user=Depends(get_current_user)):
-    if user.get("plan") not in ("artist", "producer"):
+    db = request.app.state.db
+    if await get_effective_plan(db, user) not in ("artist", "producer"):
         raise HTTPException(status_code=403, detail="Pro plan required")
 
     url = body.spotifyUrl.strip()
@@ -802,7 +806,8 @@ async def create_music_post(body: MusicPostBody, request: Request, user=Depends(
 
 @router.post("/video", status_code=201)
 async def create_video_post(request: Request, user=Depends(get_current_user)):
-    if user.get("plan") not in ("artist", "producer"):
+    db = request.app.state.db
+    if await get_effective_plan(db, user) not in ("artist", "producer"):
         raise HTTPException(status_code=403, detail="Pro plan required")
 
     form    = await request.form()
