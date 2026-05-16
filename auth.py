@@ -76,3 +76,62 @@ async def get_admin_user(user=Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+# ── Lifetime / effective-plan helpers ────────────────────────────────
+# These need to live in this root-level auth.py (not routes/auth.py)
+# because they're imported by routes/posts.py, routes/producer.py, etc.
+# via `from auth import ...` which resolves to this file, not routes/auth.py.
+#
+# The hardcoded LIFETIME_ACCOUNTS list is duplicated between this file
+# and routes/auth.py — that's intentional. Keeping both in sync requires
+# editing two places, but it avoids circular imports between root and
+# routes modules. If you change one, change the other.
+_LIFETIME_ACCOUNTS_ROOT = {
+    "Trelli":     {"plan": "producer", "is_admin": True},
+    "Mikez":      {"plan": "artist",   "is_admin": False},
+    "HMbarsdat":  {"plan": "artist",   "is_admin": False},
+}
+
+
+async def _lifetime_config_async_root(db, username: str):
+    """Same logic as routes/auth.py's _lifetime_config_async, but lives
+    here so the helpers below can be imported without circular deps."""
+    if not username:
+        return None
+    hard = _LIFETIME_ACCOUNTS_ROOT.get(username)
+    if hard:
+        return hard
+    try:
+        doc = await db.lifetime_accounts.find_one({"_id": username})
+        if doc:
+            return {
+                "plan":     doc.get("plan", "artist"),
+                "is_admin": bool(doc.get("is_admin", False)),
+            }
+    except Exception:
+        pass
+    return None
+
+
+async def get_effective_plan(db, user: dict) -> str:
+    """Return the user's effective plan, applying lifetime overrides.
+
+    Critical: any backend check that reads `user["plan"]` directly will
+    miss lifetime-granted access. Lifetime users have plan stored as
+    "free" in their user doc but are entitled to "artist" or "producer"
+    features via the LIFETIME_ACCOUNTS dict (hardcoded) or
+    db.lifetime_accounts (admin-granted).
+
+    Usage:
+        if await get_effective_plan(db, user) not in ("artist", "producer"):
+            raise HTTPException(403, "Pro plan required")
+
+    Returns the plan string: "artist" / "producer" / "free".
+    """
+    if not user:
+        return "free"
+    cfg = await _lifetime_config_async_root(db, user.get("username", ""))
+    if cfg:
+        return cfg.get("plan", "artist")
+    return user.get("plan", "free")
