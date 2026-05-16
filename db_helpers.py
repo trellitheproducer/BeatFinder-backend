@@ -121,3 +121,63 @@ async def delete_user_by_id(db, user_id):
     if oid is None:
         return _NoOp()
     return await db.users.delete_one({"_id": oid})
+
+
+def _normalize_username(username):
+    """Local copy of normalize_username for circular-import-free use.
+    Same logic as auth.py's normalize_username: lowercase + strip.
+    If you change one, change both."""
+    if not username or not isinstance(username, str):
+        return ""
+    return username.strip().lower()
+
+
+async def find_user_by_username(db, username, *, projection=None):
+    """Case-insensitive username lookup.
+
+    Strategy:
+      1. Try normalized_username (fast, uses index)
+      2. Fall back to a case-insensitive regex on `username`
+         (covers any user not yet backfilled, also a safety net)
+
+    The fallback is bounded — we only call it if the first lookup
+    missed AND the username is non-empty. So worst case it's one
+    extra DB query, not a scan storm.
+
+    Args:
+        db: motor database
+        username: any case ("Trelli", "trelli", "TRELLI")
+        projection: optional dict for find_one projection
+
+    Returns:
+        User doc or None.
+
+    Display casing is preserved on the returned doc — only the
+    LOOKUP is case-insensitive. The `username` field on the
+    returned user is whatever they originally registered with.
+    """
+    if not username:
+        return None
+    norm = _normalize_username(username)
+    if not norm:
+        return None
+
+    # Path 1 — normalized field (fast, indexed)
+    query = {"normalized_username": norm}
+    if projection:
+        user = await db.users.find_one(query, projection)
+    else:
+        user = await db.users.find_one(query)
+    if user:
+        return user
+
+    # Path 2 — case-insensitive regex fallback for not-yet-backfilled users.
+    # We escape regex specials to avoid issues with usernames containing dots
+    # or other regex chars (though usernames shouldn't have them, defence
+    # in depth never hurts).
+    import re
+    escaped = re.escape(username)
+    query = {"username": {"$regex": "^" + escaped + "$", "$options": "i"}}
+    if projection:
+        return await db.users.find_one(query, projection)
+    return await db.users.find_one(query)
