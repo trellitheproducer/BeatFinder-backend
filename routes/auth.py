@@ -949,8 +949,11 @@ async def search_users(q: str, request: Request):
 # ── Get public profile ────────────────────────────────────────────
 @router.get("/profile/{username}")
 async def get_public_profile(username: str, request: Request, _user: str = ""):
+    from db_helpers import find_user_by_username
     db   = request.app.state.db
-    user = await db.users.find_one({"username": username})
+    # Case-insensitive lookup — /profile/Trelli, /profile/trelli, /profile/TRELLI
+    # all find the same user. Display casing on the response is preserved.
+    user = await find_user_by_username(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
 
@@ -1071,8 +1074,9 @@ async def subscription_status(request: Request, user=Depends(get_current_user)):
 # ── Get public profile (authenticated — includes isFollowing) ─────
 @router.get("/profile-auth/{username}")
 async def get_public_profile_auth(username: str, request: Request, current_user=Depends(get_current_user)):
+    from db_helpers import find_user_by_username
     db   = request.app.state.db
-    user = await db.users.find_one({"username": username})
+    user = await find_user_by_username(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
 
@@ -1181,7 +1185,8 @@ async def get_public_profile_auth(username: str, request: Request, current_user=
 @router.get("/followers/{username}")
 async def get_followers(username: str, request: Request):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     target_id   = str(target["_id"])
@@ -1220,7 +1225,8 @@ async def get_followers(username: str, request: Request):
 @router.get("/following/{username}")
 async def get_following(username: str, request: Request):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     target_id    = str(target["_id"])
@@ -1256,7 +1262,8 @@ async def get_following(username: str, request: Request):
 @router.post("/follow/{username}")
 async def follow_user(username: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1311,7 +1318,8 @@ async def follow_user(username: str, request: Request, user=Depends(get_current_
 @router.delete("/follow/{username}")
 async def unfollow_user(username: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1333,7 +1341,8 @@ async def unfollow_user(username: str, request: Request, user=Depends(get_curren
 @router.post("/block/{username}")
 async def block_user(username: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1365,7 +1374,8 @@ async def block_user(username: str, request: Request, user=Depends(get_current_u
 @router.delete("/block/{username}")
 async def unblock_user(username: str, request: Request, user=Depends(get_current_user)):
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1415,7 +1425,8 @@ async def block_status(username: str, request: Request, user=Depends(get_current
       - Show 'This user has blocked you' empty state if reverse-blocked
     """
     db     = request.app.state.db
-    target = await db.users.find_one({"username": username})
+    from db_helpers import find_user_by_username
+    target = await find_user_by_username(db, username)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -2378,7 +2389,13 @@ async def admin_grant_lifetime(
     # Sanity-check: the username should actually exist as a registered user.
     # We don't enforce this strictly (admin might want to pre-grant a
     # lifetime before the user signs up), but warn in the response.
-    existing_user = await db.users.find_one({"username": uname})
+    from db_helpers import find_user_by_username
+    existing_user = await find_user_by_username(db, uname)
+    # If we found the user via case-insensitive lookup, use their actual
+    # registered casing for the lifetime record (so it matches lookups
+    # going forward).
+    if existing_user:
+        uname = existing_user.get("username", uname)
     # Don't allow re-granting one of the hardcoded permanent lifetimes —
     # they're already in effect via LIFETIME_ACCOUNTS, and granting them
     # in DB would just be noise.
