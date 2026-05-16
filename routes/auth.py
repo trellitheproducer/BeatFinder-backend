@@ -132,6 +132,58 @@ async def _ensure_email_normalization_ready(db, app_state):
                     print(f"[Admin flag] Corrected @{uname} → is_admin={expected}")
         except Exception as e:
             print(f"[Admin flag] Correction error (non-fatal): {e}")
+
+        # ── Username normalization backfill ───────────────────────
+        # Same pattern as email norm above: store a `normalized_username`
+        # field (lowercase) so future case-insensitive lookups (Deploy B)
+        # can use it for fast matches. This deploy ONLY adds the field +
+        # index. No lookup behavior changes yet.
+        try:
+            cursor = db.users.find(
+                {"username": {"$exists": True}, "normalized_username": {"$exists": False}},
+                {"_id": 1, "username": 1},
+            )
+            count = 0
+            async for u in cursor:
+                norm_u = normalize_username(u.get("username", ""))
+                if not norm_u:
+                    continue
+                await db.users.update_one(
+                    {"_id": u["_id"]},
+                    {"$set": {"normalized_username": norm_u}},
+                )
+                count += 1
+            if count:
+                print(f"[Username norm] Backfilled {count} users")
+
+            # Non-unique index for fast lookups in Deploy B.
+            # We deliberately don't make this UNIQUE in Deploy A — if
+            # case-variant duplicates already exist (Mikez + mikez),
+            # unique creation would FAIL and the index wouldn't exist.
+            # We catch dupes lazily and clean them up before flipping
+            # to unique in a follow-up deploy.
+            try:
+                await db.users.create_index("normalized_username")
+                print("[Username norm] Index ensured on users.normalized_username")
+            except Exception as e:
+                print(f"[Username norm] Could not create index: {e}")
+
+            # Surface any existing case-variant duplicates so we know
+            # what to clean up before flipping to UNIQUE.
+            try:
+                pipeline = [
+                    {"$match": {"normalized_username": {"$exists": True, "$ne": ""}}},
+                    {"$group": {"_id": "$normalized_username", "count": {"$sum": 1},
+                                "usernames": {"$push": "$username"}}},
+                    {"$match": {"count": {"$gt": 1}}},
+                ]
+                dupes = await db.users.aggregate(pipeline).to_list(50)
+                for d in dupes:
+                    print(f"[Username norm] ⚠ DUPLICATE case-variant '{d['_id']}': {d['usernames']}")
+            except Exception as e:
+                print(f"[Username norm] Could not scan duplicates: {e}")
+        except Exception as e:
+            print(f"[Username norm] Backfill error (non-fatal): {e}")
     except Exception as e:
         # Don't break login/register if migration fails — log and move on.
         # The endpoints have a fallback to case-insensitive raw email lookup.
@@ -182,6 +234,24 @@ def normalize_email(email: str) -> str:
         # Normalize domain to gmail.com for both legacy variants
         domain = "gmail.com"
     return local + "@" + domain
+
+
+def normalize_username(username: str) -> str:
+    """Return a canonical form of a username for uniqueness + lookup.
+
+    Strategy: lowercase + strip whitespace. We keep the user's original
+    casing in the `username` field for display ("Trelli" displays as
+    "Trelli", not "trelli"), but compare/lookup uses this normalized
+    form. Same pattern as Twitter/Instagram.
+
+    Why this matters: without normalization, "Trelli", "trelli", and
+    "TRELLI" are three different accounts — duplicate handles slip
+    through, /profile/trelli 404s when the canonical handle is
+    "Trelli", DMs/mentions/follows all break across cases.
+    """
+    if not username or not isinstance(username, str):
+        return ""
+    return username.strip().lower()
 
 
 # ── Timestamp helper ─────────────────────────────────────────────────
@@ -266,6 +336,58 @@ async def _lifetime_config_async(db, username: str):
     except Exception:
         pass
     return None
+
+
+async def get_effective_plan(db, user: dict) -> str:
+    """Return the user's effective plan, applying lifetime overrides.
+
+    Critical: any backend check that reads `user["plan"]` directly will
+    miss lifetime-granted access. Lifetime users have plan stored as
+    "free" in their user doc but are entitled to "artist" or "producer"
+    features via LIFETIME_ACCOUNTS (hardcoded) or db.lifetime_accounts
+    (admin-granted).
+
+    Usage:
+        if await get_effective_plan(db, user) not in ("artist", "producer"):
+            raise HTTPException(403, "Pro plan required")
+
+    Returns the plan string: "artist" / "producer" / "free".
+    """
+    if not user:
+        return "free"
+    cfg = await _lifetime_config_async(db, user.get("username", ""))
+    if cfg:
+        return cfg.get("plan", "artist")
+    return user.get("plan", "free")
+
+
+async def has_active_pro(db, user: dict, *, require_producer: bool = False) -> bool:
+    """Whether the user is entitled to Pro features (subscription OR lifetime).
+
+    require_producer=True means producer-tier specifically (e.g. selling
+    beats requires producer, not just artist).
+
+    Lifetime accounts ALWAYS pass — they're entitled regardless of
+    subscriptionActive (which is False on their underlying user doc).
+    """
+    if not user:
+        return False
+    eff = await get_effective_plan(db, user)
+    # Lifetime path: if the user is in LIFETIME_ACCOUNTS or db.lifetime_accounts
+    # then `eff` reflects the override and we trust it directly.
+    cfg = await _lifetime_config_async(db, user.get("username", ""))
+    if cfg:
+        if require_producer:
+            return eff == "producer"
+        return eff in ("artist", "producer")
+    # Regular path: stored plan + active subscription check.
+    if require_producer:
+        if eff != "producer":
+            return False
+    else:
+        if eff not in ("artist", "producer"):
+            return False
+    return bool(user.get("subscriptionActive", False))
 
 
 
@@ -709,11 +831,27 @@ async def set_username(body: UsernameRequest, request: Request, user=Depends(get
         raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, dots and underscores")
 
     db = request.app.state.db
-    existing = await db.users.find_one({"username": username})
+    # Case-insensitive uniqueness: even though `username` is stored
+    # with the original casing for display, two users can't claim
+    # case-variants of the same handle. Check the normalized form.
+    norm_u = normalize_username(username)
+    existing = await db.users.find_one({
+        "$or": [
+            {"normalized_username": norm_u},
+            # Fallback for legacy rows not yet backfilled
+            {"username": {"$regex": "^" + _re_escape(username) + "$", "$options": "i"}},
+        ]
+    })
     if existing and str(existing["_id"]) != str(user["_id"]):
         raise HTTPException(status_code=409, detail="Username already taken")
 
-    await db.users.update_one({"_id": user["_id"]}, {"$set": {"username": username}})
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "username": username,                  # original casing for display
+            "normalized_username": norm_u,         # lowercase for lookup/uniqueness
+        }},
+    )
     return {"success": True, "username": username}
 
 
@@ -2048,7 +2186,10 @@ async def upload_track(
     file: UploadFile = File(...),
 ):
     """Artist Pro users upload their recorded tracks (MP3/WAV)."""
-    plan = user.get("plan","free")
+    db   = request.app.state.db
+    # Effective plan applies lifetime override so granted-lifetime
+    # users can upload tracks.
+    plan = await get_effective_plan(db, user)
     if plan not in ("artist","producer"):
         raise HTTPException(status_code=403, detail="Artist Pro plan required to upload tracks")
 
