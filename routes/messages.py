@@ -80,8 +80,11 @@ async def _is_in_inbox(db, me: str, them: str) -> bool:
         return True
 
     # 2. Do I follow them? Look up by username → user id, then check follows.
-    them_user = await db.users.find_one({"username": them}, {"_id": 1})
-    me_user   = await db.users.find_one({"username": me},   {"_id": 1})
+    # Case-insensitive lookup so it works regardless of how the username
+    # was capitalized in the message record.
+    from db_helpers import find_user_by_username
+    them_user = await find_user_by_username(db, them, projection={"_id": 1})
+    me_user   = await find_user_by_username(db, me,   projection={"_id": 1})
     if them_user and me_user:
         is_following = await db.follows.find_one({
             "follower_id":  str(me_user["_id"]),
@@ -367,16 +370,20 @@ async def send_message(body: SendMessageBody, request: Request, user=Depends(get
     if len(text) > 2000:
         raise HTTPException(status_code=400, detail="Message too long (max 2000 chars)")
 
-    recipient = await db.users.find_one({"username": body.to})
+    from db_helpers import find_user_by_username
+    recipient = await find_user_by_username(db, body.to)
     if not recipient:
         raise HTTPException(status_code=404, detail="User not found")
-    if body.to == username:
+    # Use the recipient's REGISTERED casing for the message record so DMs
+    # store consistently regardless of how the sender typed the @handle.
+    canonical_to = recipient.get("username", body.to)
+    if canonical_to == username:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
     doc = {
         "_id":           str(ObjectId()),
         "from_username": username,
-        "to_username":   body.to,
+        "to_username":   canonical_to,
         "text":          text,
         "created_at":    datetime.utcnow(),
         "read":          False,
@@ -389,7 +396,7 @@ async def send_message(body: SendMessageBody, request: Request, user=Depends(get
     # (otherwise an outbound reply could land in my own requests folder,
     # which makes no sense). The RECIPIENT'S inbox-vs-requests state
     # is decided at read-time based on whether they follow us.
-    await _mark_accepted(db, username, body.to)
+    await _mark_accepted(db, username, canonical_to)
 
     return _msg_out(doc)
 
