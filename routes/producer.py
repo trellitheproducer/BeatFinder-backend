@@ -5,7 +5,7 @@ import hashlib
 import time
 import os
 
-from auth import get_current_user
+from auth import get_current_user, get_effective_plan
 
 router = APIRouter()
 
@@ -168,7 +168,11 @@ async def upload_beat(
     file:        UploadFile = File(...),
 ):
     if user.get("plan") != "producer":
-        raise HTTPException(status_code=403, detail="Producer Pro plan required to upload beats")
+        # Lifetime artists shouldn't get past this — they're not producers.
+        # But lifetime PRODUCERS (Trelli) need the override applied.
+        db = request.app.state.db
+        if await get_effective_plan(db, user) != "producer":
+            raise HTTPException(status_code=403, detail="Producer Pro plan required to upload beats")
 
     allowed_ext = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".aiff", ".opus")
     if not any(file.filename.lower().endswith(e) for e in allowed_ext):
@@ -346,7 +350,9 @@ async def my_beats(request: Request, user=Depends(get_current_user)):
 @router.post("/connect-stripe")
 async def connect_stripe(request: Request, user=Depends(get_current_user)):
     if user.get("plan") != "producer":
-        raise HTTPException(status_code=403, detail="Producer Pro required")
+        db = request.app.state.db
+        if await get_effective_plan(db, user) != "producer":
+            raise HTTPException(status_code=403, detail="Producer Pro required")
 
     # Get or create the Stripe account first
     account_id = await _get_or_create_stripe_account(user, request)
@@ -470,7 +476,9 @@ async def buy_lease(beat_id: str, request: Request, user=Depends(get_current_use
     # gate (sites 7745/8054/10123/11013 in BeatFinder.jsx) — backend
     # check is defence-in-depth in case someone bypasses the UI.
     if tier == "premium":
-        u_plan = (user.get("plan") or "free").lower()
+        # Use effective plan so lifetime users qualify
+        db = request.app.state.db
+        u_plan = (await get_effective_plan(db, user)).lower()
         if u_plan not in ("artist", "producer"):
             raise HTTPException(
                 status_code=403,
