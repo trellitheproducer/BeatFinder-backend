@@ -525,6 +525,22 @@ async def register(body: RegisterRequest, request: Request):
         raise HTTPException(status_code=409, detail="Email already registered")
 
     user_id = str(ObjectId())
+
+    # Marketing opt-in — comes from the signup form checkbox. Defaults
+    # to False (GDPR-safe). We capture it from the raw request body
+    # since the RegisterRequest model doesn't have this field yet, and
+    # adding fields to the Pydantic model would need a separate change
+    # to models.py.
+    marketing_opt_in = False
+    try:
+        raw_body = await request.json()
+        if isinstance(raw_body, dict):
+            marketing_opt_in = bool(raw_body.get("marketing_opt_in", False))
+    except Exception:
+        # If JSON parsing fails for any reason (shouldn't with FastAPI
+        # but defence in depth), default to False — never assume consent.
+        pass
+
     user = {
         "_id":              user_id,
         "name":             body.name,
@@ -536,6 +552,11 @@ async def register(body: RegisterRequest, request: Request):
         "bio":              "",
         "location":         "",
         "created_at":       datetime.utcnow(),
+        # Marketing consent: True only if the user explicitly ticked
+        # the box at signup. Records the timestamp so we have an audit
+        # trail of consent (useful for GDPR DSAR / compliance queries).
+        "marketing_opt_in":  marketing_opt_in,
+        "marketing_opt_in_at": datetime.utcnow() if marketing_opt_in else None,
     }
     await db.users.insert_one(user)
     token = create_token(user_id, body.email)
@@ -2733,3 +2754,116 @@ async def admin_delete_user(
         "deleted_at": now.isoformat(),
         "anon_username": anon_username,
     }
+
+
+# ── Admin: Email list export + stats ─────────────────────────────────────────
+# Two endpoints to support a "build a mailing list" workflow without bringing
+# in a third-party email platform yet:
+#
+#   GET /admin/email-stats   — quick counts for the admin UI
+#   GET /admin/export-emails — streams a CSV of opted-in users for download
+#
+# "Opted-in" definition (soft opt-in model):
+#   • marketing_opt_in == True               → explicitly consented (new signup)
+#   • marketing_opt_in field missing/absent  → existing user, pre-checkbox era
+#                                              (legal basis: PECR soft opt-in)
+#   • marketing_opt_in == False              → user actively opted OUT, NEVER include
+#
+# IMPORTANT: when you send marketing emails to this list, every message MUST
+# include an unsubscribe link. When users unsubscribe, set marketing_opt_in
+# to False on their user doc to suppress them from all future exports.
+#
+# Deleted users are excluded entirely.
+
+@router.get("/admin/email-stats")
+async def admin_email_stats(request: Request, _admin=Depends(get_admin_user)):
+    """Return counts of opted-in users for the admin dashboard."""
+    db = request.app.state.db
+    # Active = not deleted. Opted-in = field is True OR field is missing.
+    base_filter = {"deleted": {"$ne": True}}
+
+    total_active = await db.users.count_documents(base_filter)
+
+    explicit_opt_in = await db.users.count_documents({
+        **base_filter,
+        "marketing_opt_in": True,
+    })
+
+    soft_opt_in = await db.users.count_documents({
+        **base_filter,
+        "marketing_opt_in": {"$exists": False},
+    })
+
+    explicit_opt_out = await db.users.count_documents({
+        **base_filter,
+        "marketing_opt_in": False,
+    })
+
+    return {
+        "total_active":     total_active,
+        "explicit_opt_in":  explicit_opt_in,   # ticked the box at signup
+        "soft_opt_in":      soft_opt_in,        # existing pre-checkbox users
+        "explicit_opt_out": explicit_opt_out,   # actively opted out
+        "exportable_total": explicit_opt_in + soft_opt_in,
+    }
+
+
+@router.get("/admin/export-emails")
+async def admin_export_emails(request: Request, _admin=Depends(get_admin_user)):
+    """Stream a CSV of opted-in users for mailing-list import.
+
+    Columns: email, name, username, plan, consent_type, signed_up_at
+
+    consent_type column values:
+      • "explicit"  — user ticked the marketing-opt-in box at signup
+      • "soft"      — existing pre-checkbox user (PECR soft opt-in basis)
+
+    Use the consent_type column to filter in your mailing tool if you want
+    to send only to explicit-consent users (lower risk in EU).
+    """
+    from fastapi.responses import StreamingResponse
+    import csv, io
+
+    db = request.app.state.db
+    cursor = db.users.find({
+        "deleted":          {"$ne": True},
+        "marketing_opt_in": {"$ne": False},  # excludes explicit opt-outs
+    }, {
+        "email":             1,
+        "name":              1,
+        "username":          1,
+        "plan":              1,
+        "marketing_opt_in":  1,
+        "created_at":        1,
+    })
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["email", "name", "username", "plan", "consent_type", "signed_up_at"])
+
+    rows_written = 0
+    async for u in cursor:
+        email = (u.get("email") or "").strip()
+        if not email:
+            continue  # never export blank-email rows
+        if email.endswith("@deleted.beatfinder.invalid"):
+            continue  # anonymized deleted accounts
+        explicit = bool(u.get("marketing_opt_in", False))
+        writer.writerow([
+            email,
+            u.get("name", "") or "",
+            u.get("username", "") or "",
+            u.get("plan", "free") or "free",
+            "explicit" if explicit else "soft",
+            u.get("created_at").isoformat() if isinstance(u.get("created_at"), datetime) else "",
+        ])
+        rows_written += 1
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    # Filename includes timestamp so you can keep multiple snapshots
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    headers = {
+        "Content-Disposition": f'attachment; filename="beatfinder-emails-{stamp}.csv"',
+        "X-Total-Rows":         str(rows_written),
+    }
+    return StreamingResponse(io.BytesIO(csv_bytes), media_type="text/csv", headers=headers)
