@@ -1,44 +1,38 @@
 """
 Studio Projects — cloud sync for Studio projects.
 
-Phase 1 of the project sync rollout. Provides CRUD over a user's project
-metadata (track config, FX state, BPM, clip positions/durations, clip
-URLs). Audio buffers themselves are NOT uploaded here — that's Phase 2.
-For now:
-  • Beat clips reference an existing Cloudinary URL (already-uploaded)
-  • Vocal clips are stored with no audio URL → audio doesn't survive
-    reinstall yet. Will be added in Phase 2.
+Phase 1 (deployed): MongoDB metadata sync — track config, FX state, BPM,
+clip positions/durations. Audio blobs not uploaded.
 
-Storage model:
+Phase 2 (this update): Vocal audio upload to Cloudinary.
+  • New endpoint /sign-vocal-upload returns a time-limited Cloudinary
+    signature that the FRONTEND uses to PUT the audio file directly to
+    Cloudinary (server-mediated upload would double bandwidth and risk
+    timeouts on big multi-take vocals).
+  • Public_id is namespaced per-user per-project per-clip — even if a
+    signature were stolen, it could only overwrite ONE specific clip
+    slot, not arbitrary files.
+  • Resource type is "video" because Cloudinary uses that endpoint for
+    audio files too. Folder structure: beatfinder/studio/{user_id}/{proj}/
+  • Frontend posts cloud URL back as part of the project save body —
+    audio URL appears inside each vocal clip in the saved track JSON.
+
+Storage model (Phase 2 adds `vocal_url` per clip in saved project):
   MongoDB collection `studio_projects`:
-    {
-      _id: <str ObjectId>,
-      user_id: <str>,
-      name: <str>,
-      bpm: <int>, key: <str>, time_sig_num: <int>,
-      loop_in: <float>, loop_out: <float>,
-      master_volume: <float>,
-      tracks: [ ... track objects with clips ... ],
-      created_at: <datetime>,
-      updated_at: <datetime>,
-      size_bytes: <int>,  // approximate JSON size for quota tracking
-    }
-
-Access control:
-  • All endpoints require authenticated user
-  • Cloud sync is a Pro feature — gated via get_effective_plan
-  • Users can only access their own projects (user_id match enforced)
-
-Limits:
-  • PROJECT_SIZE_LIMIT: 1MB per project (metadata only)
-  • PROJECT_COUNT_LIMIT: 50 projects per user (Pro/lifetime)
-  • Free users blocked at the endpoint level entirely
+    tracks: [
+      { ..., clips: [
+          { id, startTime, ..., vocalUrl: "https://res.cloudinary.com/..." }
+      ]}
+    ]
 """
 from fastapi import APIRouter, HTTPException, Request, Depends
 from datetime import datetime
 from bson import ObjectId
 from typing import Any
 import json
+import os
+import time as _time
+import hashlib
 
 # ROOT auth module (not routes/auth) — get_current_user, get_effective_plan
 from auth import get_current_user, get_effective_plan
@@ -47,6 +41,7 @@ router = APIRouter()
 
 PROJECT_SIZE_LIMIT  = 1 * 1024 * 1024   # 1MB max per project document
 PROJECT_COUNT_LIMIT = 50                # max projects per user
+VOCAL_MAX_BYTES     = 25 * 1024 * 1024  # 25MB hard cap per vocal upload
 
 
 def _require_pro(user, effective_plan):
@@ -246,11 +241,116 @@ async def save_project(request: Request, user=Depends(get_current_user)):
     }
 
 
+@router.post("/sign-vocal-upload")
+async def sign_vocal_upload(request: Request, user=Depends(get_current_user)):
+    """Return a Cloudinary signature for the frontend to upload a vocal audio file.
+
+    Why signed-direct-upload instead of routing through backend?
+      Audio recordings can be 5-30MB easily. Server-mediated uploads
+      would double the bandwidth (browser→server→Cloudinary) and risk
+      iOS Safari request timeouts on 4G. Direct uploads from the
+      browser to Cloudinary are faster and don't burn our server CPU.
+
+    Body shape:
+      {
+        "project_id": "<mongo project ID>",
+        "clip_id":    "<unique clip ID — used as public_id namespace>"
+      }
+
+    Returns:
+      {
+        "cloud_name":   "...",
+        "api_key":      "...",
+        "timestamp":    <int>,
+        "signature":    "...",
+        "folder":       "beatfinder/studio/<user>/<project>",
+        "public_id":    "vocal_<clip_id>",
+        "upload_url":   "https://api.cloudinary.com/v1_1/<cloud>/video/upload",
+        "resource_type":"video"
+      }
+
+    Frontend then POSTs the audio File/Blob to upload_url with the
+    returned fields. Cloudinary responds with `secure_url` which the
+    frontend stores on the clip and includes in the next project save.
+
+    Signature scope:
+      • Folder is fixed to the user+project — signature can't be reused
+        to upload elsewhere
+      • public_id contains the clip_id — bounded to one slot per clip
+      • timestamp limits replay window (Cloudinary enforces ~1hr default)
+    """
+    db = request.app.state.db
+    plan = await get_effective_plan(db, user)
+    _require_pro(user, plan)
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    project_id = (body or {}).get("project_id", "")
+    clip_id    = (body or {}).get("clip_id", "")
+
+    # Validate IDs to prevent path traversal or weird characters in folder names
+    if not isinstance(project_id, str) or not project_id or len(project_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid project_id")
+    if not isinstance(clip_id, str) or not clip_id or len(clip_id) > 64:
+        raise HTTPException(status_code=400, detail="Invalid clip_id")
+    # Strip anything that isn't alphanumeric, hyphen, underscore, dot
+    import re
+    if not re.match(r"^[A-Za-z0-9._-]+$", project_id):
+        raise HTTPException(status_code=400, detail="project_id contains invalid characters")
+    if not re.match(r"^[A-Za-z0-9._-]+$", clip_id):
+        raise HTTPException(status_code=400, detail="clip_id contains invalid characters")
+
+    # Verify the project exists and belongs to this user. We don't want
+    # someone signing uploads against project IDs that aren't theirs —
+    # even though folder namespacing protects against cross-user damage,
+    # this catches bad client state earlier.
+    proj = await db.studio_projects.find_one({
+        "_id":     project_id,
+        "user_id": str(user["_id"]),
+    })
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found — save the project before uploading audio")
+
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Audio storage not configured")
+
+    timestamp = int(_time.time())
+    folder    = f"beatfinder/studio/{user['_id']}/{project_id}"
+    public_id = f"vocal_{clip_id}"
+
+    # Cloudinary signature: SHA-256 of "key1=val1&key2=val2..." + api_secret
+    # MUST be alphabetical order of keys. We include folder and public_id
+    # so they're bound into the signature and can't be swapped by a client.
+    to_sign   = f"folder={folder}&public_id={public_id}&timestamp={timestamp}" + api_secret
+    signature = hashlib.sha256(to_sign.encode()).hexdigest()
+
+    return {
+        "cloud_name":    cloud_name,
+        "api_key":       api_key,
+        "timestamp":     timestamp,
+        "signature":     signature,
+        "folder":        folder,
+        "public_id":     public_id,
+        "upload_url":    f"https://api.cloudinary.com/v1_1/{cloud_name}/video/upload",
+        "resource_type": "video",
+    }
+
+
 @router.delete("/delete/{project_id}")
 async def delete_project(project_id: str, request: Request, user=Depends(get_current_user)):
-    """Delete a project.
+    """Delete a project + its associated Cloudinary vocal recordings.
 
     Enforces ownership via the filter — no cross-user deletion possible.
+
+    Cleanup is best-effort: if Cloudinary deletion fails, the Mongo doc
+    is still removed and we log the failure. Orphaned Cloudinary files
+    waste storage but don't affect functionality. A nightly job could
+    sweep these later if we ever notice cost growth.
     """
     db = request.app.state.db
     plan = await get_effective_plan(db, user)
@@ -262,4 +362,29 @@ async def delete_project(project_id: str, request: Request, user=Depends(get_cur
     })
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Sweep Cloudinary folder for this project. Folder structure:
+    #   beatfinder/studio/<user_id>/<project_id>/vocal_<clip_id>
+    # Cloudinary supports deleting all resources by prefix via the Admin API.
+    try:
+        cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+        api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+        api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+        if cloud_name and api_key and api_secret:
+            import httpx
+            from base64 import b64encode
+            prefix = f"beatfinder/studio/{user['_id']}/{project_id}"
+            # Admin API uses HTTP Basic Auth with api_key:api_secret
+            auth = b64encode(f"{api_key}:{api_secret}".encode()).decode()
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.delete(
+                    f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/video",
+                    params={"prefix": prefix},
+                    headers={"Authorization": f"Basic {auth}"},
+                )
+    except Exception as e:
+        # Best-effort — log but don't fail the delete. User's project doc
+        # is already gone; orphaned Cloudinary files only waste storage.
+        print(f"[studio_projects] Cloudinary cleanup failed for {project_id}: {e}")
+
     return {"deleted": True, "id": project_id}
