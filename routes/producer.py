@@ -87,7 +87,7 @@ async def send_lease_receipt_email(
   <div style="color:#666;font-size:12px;text-align:center;margin-bottom:24px">You can re-download this beat anytime from your Profile → My Leases.</div>
 
   <div style="border-top:1px solid #222;padding-top:16px;color:#555;font-size:11px;line-height:1.6">
-    This is your receipt — keep it for your records. The full licence agreement you accepted at checkout governs your use of this beat. Questions or disputes: trellitheproducer@gmail.com
+    This is your receipt — keep it for your records. The full licence agreement you accepted at checkout governs your use of this beat. Questions or disputes: support@beatfinder.co.uk
   </div>
 </div>
 """
