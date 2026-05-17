@@ -53,7 +53,7 @@ async def send_welcome_email(to_email: str, name: str, plan: str, billing: str =
     <li>Log in to your account</li>
     <li>Enjoy your """ + plan_label + """ features!</li>
   </ol>
-  <div style="color:#555;font-size:12px;margin-top:24px">If you need help contact us at trellitheproducer@gmail.com</div>
+  <div style="color:#555;font-size:12px;margin-top:24px">If you need help contact us at support@beatfinder.co.uk</div>
 </div>
 """
     try:
@@ -84,7 +84,7 @@ async def send_expiry_warning_email(to_email: str, name: str, plan: str, expires
   <div style="font-size:32px;font-weight:900;letter-spacing:4px;color:#C026D3;margin-bottom:8px">BEATFINDER</div>
   <div style="color:white;font-size:18px;font-weight:700;margin-bottom:12px">Your """ + plan_label + """ subscription is expiring soon</div>
   <div style="color:#aaa;margin-bottom:24px">Hi """ + name + ", your subscription expires on <strong>" + expires + """</strong>. Renew now to keep access to all your pro features — you won't lose any of your content.</div>
-  <div style="color:#555;font-size:12px;margin-top:24px">Questions? trellitheproducer@gmail.com</div>
+  <div style="color:#555;font-size:12px;margin-top:24px">Questions? support@beatfinder.co.uk</div>
 </div>
 """
     try:
@@ -155,7 +155,7 @@ async def send_payment_failed_email(
     <li>Tap "Manage Subscription"</li>
     <li>Update your card on Stripe's secure portal</li>
   </ol>
-  <div style="color:#555;font-size:12px;margin-top:24px">Questions or need help? trellitheproducer@gmail.com</div>
+  <div style="color:#555;font-size:12px;margin-top:24px">Questions or need help? support@beatfinder.co.uk</div>
 </div>
 """
     try:
