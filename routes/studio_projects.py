@@ -348,43 +348,140 @@ async def delete_project(project_id: str, request: Request, user=Depends(get_cur
     Enforces ownership via the filter — no cross-user deletion possible.
 
     Cleanup is best-effort: if Cloudinary deletion fails, the Mongo doc
-    is still removed and we log the failure. Orphaned Cloudinary files
-    waste storage but don't affect functionality. A nightly job could
-    sweep these later if we ever notice cost growth.
+    is still removed and we log the failure (visible in Render logs).
+    Orphaned Cloudinary files waste storage but don't affect functionality.
+
+    Cleanup strategy (in order of preference):
+      1. Fetch the project doc BEFORE deleting Mongo → walk every clip
+         and collect any `vocalUrl` Cloudinary public_ids → delete those
+         specifically. This is the reliable path.
+      2. Fallback: prefix-based deletion of the project's Cloudinary
+         folder. Catches any orphans not referenced by the doc.
     """
     db = request.app.state.db
     plan = await get_effective_plan(db, user)
     _require_pro(user, plan)
 
-    result = await db.studio_projects.delete_one({
+    user_id = str(user["_id"])
+
+    # Fetch the project FIRST so we can extract vocalUrls before deleting
+    proj = await db.studio_projects.find_one({
         "_id":     project_id,
-        "user_id": str(user["_id"]),
+        "user_id": user_id,
     })
-    if result.deleted_count == 0:
+    if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Sweep Cloudinary folder for this project. Folder structure:
-    #   beatfinder/studio/<user_id>/<project_id>/vocal_<clip_id>
-    # Cloudinary supports deleting all resources by prefix via the Admin API.
-    try:
-        cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
-        api_key    = os.getenv("CLOUDINARY_API_KEY", "")
-        api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
-        if cloud_name and api_key and api_secret:
-            import httpx
-            from base64 import b64encode
-            prefix = f"beatfinder/studio/{user['_id']}/{project_id}"
-            # Admin API uses HTTP Basic Auth with api_key:api_secret
-            auth = b64encode(f"{api_key}:{api_secret}".encode()).decode()
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.delete(
-                    f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/video",
-                    params={"prefix": prefix},
-                    headers={"Authorization": f"Basic {auth}"},
-                )
-    except Exception as e:
-        # Best-effort — log but don't fail the delete. User's project doc
-        # is already gone; orphaned Cloudinary files only waste storage.
-        print(f"[studio_projects] Cloudinary cleanup failed for {project_id}: {e}")
+    # Extract Cloudinary public_ids from vocalUrls before we lose them
+    public_ids_to_delete = []
+    for track in proj.get("tracks", []):
+        for clip in (track.get("clips", []) or []):
+            vocal_url = clip.get("vocalUrl") or clip.get("vocal_url")
+            if not vocal_url or not isinstance(vocal_url, str):
+                continue
+            # Cloudinary URLs look like:
+            # https://res.cloudinary.com/{cloud}/video/upload/v123/beatfinder/studio/<user>/<proj>/vocal_<clip>.wav
+            # public_id is everything after /upload/v123/ minus extension
+            try:
+                if "/upload/" in vocal_url:
+                    after_upload = vocal_url.split("/upload/", 1)[1]
+                    # Strip leading version (v123/) if present
+                    parts = after_upload.split("/", 1)
+                    if parts[0].startswith("v") and parts[0][1:].isdigit():
+                        after_upload = parts[1] if len(parts) > 1 else ""
+                    # Strip extension
+                    if "." in after_upload.rsplit("/", 1)[-1]:
+                        after_upload = after_upload.rsplit(".", 1)[0]
+                    if after_upload:
+                        public_ids_to_delete.append(after_upload)
+            except Exception as e:
+                print(f"[studio_projects] Could not parse vocalUrl '{vocal_url}': {e}")
 
-    return {"deleted": True, "id": project_id}
+    # NOW delete the Mongo doc
+    result = await db.studio_projects.delete_one({
+        "_id":     project_id,
+        "user_id": user_id,
+    })
+    if result.deleted_count == 0:
+        # Vanishingly rare race — re-check failed. Treat as 404.
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Cloudinary cleanup
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+    api_key    = os.getenv("CLOUDINARY_API_KEY", "")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "")
+    if not (cloud_name and api_key and api_secret):
+        print(f"[studio_projects] Skipping Cloudinary cleanup — env not configured")
+        return {"deleted": True, "id": project_id, "cloudinary_deleted": 0}
+
+    import httpx
+    from base64 import b64encode
+
+    auth_header = "Basic " + b64encode(f"{api_key}:{api_secret}".encode()).decode()
+    deleted_count = 0
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # Strategy 1: delete each known public_id explicitly.
+        # POST /resources/video/destroy with public_id, or batch delete
+        # via DELETE /resources/video?public_ids[]=...
+        if public_ids_to_delete:
+            try:
+                # Build form data with multiple public_ids
+                # Cloudinary supports up to 100 per call
+                for chunk_start in range(0, len(public_ids_to_delete), 100):
+                    chunk = public_ids_to_delete[chunk_start:chunk_start + 100]
+                    resp = await client.delete(
+                        f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/video/upload",
+                        params=[("public_ids[]", pid) for pid in chunk] + [("invalidate", "true")],
+                        headers={"Authorization": auth_header},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        deleted = data.get("deleted", {}) or {}
+                        # `deleted` maps public_id -> "deleted" / "not_found"
+                        deleted_count += sum(1 for v in deleted.values() if v == "deleted")
+                        print(f"[studio_projects] Cloudinary deleted {deleted_count}/{len(chunk)} for {project_id}: {deleted}")
+                    else:
+                        print(f"[studio_projects] Cloudinary delete failed status={resp.status_code}: {resp.text[:300]}")
+            except Exception as e:
+                print(f"[studio_projects] Cloudinary explicit delete error for {project_id}: {e}")
+
+        # Strategy 2: prefix sweep — catches anything orphaned (e.g.
+        # uploads that finished but never got a vocalUrl into the doc).
+        try:
+            prefix = f"beatfinder/studio/{user_id}/{project_id}"
+            resp = await client.delete(
+                f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/video/upload",
+                params={"prefix": prefix, "invalidate": "true"},
+                headers={"Authorization": auth_header},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                prefix_deleted = data.get("deleted", {}) or {}
+                added = sum(1 for v in prefix_deleted.values() if v == "deleted")
+                if added:
+                    deleted_count += added
+                    print(f"[studio_projects] Cloudinary prefix sweep deleted {added} extra files for {project_id}")
+            else:
+                print(f"[studio_projects] Cloudinary prefix sweep failed status={resp.status_code}: {resp.text[:300]}")
+        except Exception as e:
+            print(f"[studio_projects] Cloudinary prefix sweep error for {project_id}: {e}")
+
+        # Strategy 3: explicitly delete the now-empty folder so it doesn't
+        # show up as a ghost in the Media Library.
+        try:
+            folder = f"beatfinder/studio/{user_id}/{project_id}"
+            await client.delete(
+                f"https://api.cloudinary.com/v1_1/{cloud_name}/folders/{folder}",
+                headers={"Authorization": auth_header},
+            )
+        except Exception as e:
+            # Non-fatal — folder deletion sometimes 404s if Cloudinary
+            # already removed it when emptied. Ignore.
+            print(f"[studio_projects] Folder delete (cosmetic) skipped: {e}")
+
+    return {
+        "deleted": True,
+        "id": project_id,
+        "cloudinary_deleted": deleted_count,
+    }
