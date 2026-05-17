@@ -25,6 +25,7 @@ from routes.contracts import router as contracts_router
 from routes.bpm import router as bpm_router
 from routes.support_routes import router as support_router
 from routes.studio_projects import router as studio_projects_router
+from routes.fx_presets import router as fx_presets_router
 
 load_dotenv()
 
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI):
     await app.state.db.bpm_cache.create_index("created_at", expireAfterSeconds=30 * 24 * 3600)
     # Studio project cloud sync — lookup by user, sort by recency
     await app.state.db.studio_projects.create_index([("user_id", 1), ("updated_at", -1)])
+    # Admin-managed FX presets — sort by recency for the list view
+    await app.state.db.fx_presets.create_index([("created_at", 1)])
     print("Indexes ready")
     yield
     app.state.mongo.close()
@@ -89,6 +92,8 @@ app.include_router(contracts_router,       prefix="/api/contracts",      tags=["
 app.include_router(bpm_router,             prefix="/api/bpm",            tags=["BPM Detection"])
 app.include_router(support_router,         prefix="/api",                tags=["Support"])
 app.include_router(studio_projects_router, prefix="/api/studio/projects", tags=["Studio Projects"])
+# FX Presets uses absolute paths (mixed public + admin) so no prefix.
+app.include_router(fx_presets_router, tags=["FX Presets"])
 
 from routes.producer import lease_webhook
 app.post("/api/producer/lease-webhook")(lease_webhook)
